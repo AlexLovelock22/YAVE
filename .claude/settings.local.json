@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Get-Command glslc -ErrorAction SilentlyContinue; Get-ChildItem \"C:\\\\VulkanSDK\" -ErrorAction SilentlyContinue | Select-Object Name; Get-ChildItem \"$env:VULKAN_SDK\\\\Bin\\\\glslc.exe\" -ErrorAction SilentlyContinue)",
+      "Read(//c/VulkanSDK/**)",
+      "Read(//c//**)",
+      "PowerShell(cd C:\\\\Users\\\\kloak\\\\YAVE; $env:RUST_BACKTRACE=1; cargo run 2>&1 | Select-Object -Last 40)",
+      "Bash(cargo check *)",
+      "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\kloak\\\\YAVE\" -Force)",
+      "Bash(Select-Object Name, PSIsContainer)"
+    ]
+  }
+}

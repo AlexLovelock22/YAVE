@@ -1,0 +1,18 @@
+[package]
+name = "yave"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ash = { version = "0.38", features = ["linked"] }
+ash-window = "0.13"
+winit = { version = "0.30", features = ["rwh_06"] }
+glam = "0.29"
+bytemuck = { version = "1", features = ["derive"] }
+anyhow = "1"
+rayon = "1"
+log = "0.4"
+env_logger = "0.11"
+raw-window-handle = "0.6"
+
+[build-dependencies]
