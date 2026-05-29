@@ -21,19 +21,9 @@ pub fn cube() -> BlockModel {
     }
 }
 
-/// Water block: full sides and bottom for greedy merging, top at WATER_TOP_HEIGHT.
-/// The recessed top creates a visible lip where water meets adjacent solid blocks.
+/// Water block: identical geometry to a cube so all faces greedy-merge.
 pub fn water() -> BlockModel {
-    BlockModel {
-        faces: [
-            Some(make_face(FaceDir::PosX)),
-            Some(make_face(FaceDir::NegX)),
-            Some(make_face_water_top()),
-            Some(make_face(FaceDir::NegY)),
-            Some(make_face(FaceDir::PosZ)),
-            Some(make_face(FaceDir::NegZ)),
-        ],
-    }
+    cube()
 }
 
 /// Half-height slab occupying y=[0, 0.5].

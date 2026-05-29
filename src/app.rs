@@ -34,7 +34,7 @@ impl App {
         let aspect = size.width as f32 / size.height as f32;
         let camera = Camera::new(aspect);
 
-        let RD = 4;
+        let RD = 40;
         let mut world = World::new(RD);
         world.update(camera.position, &renderer.ctx, renderer.command_pool());
 

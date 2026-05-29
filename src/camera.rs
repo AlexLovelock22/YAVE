@@ -15,7 +15,7 @@ pub struct Camera {
 impl Camera {
     pub fn new(aspect: f32) -> Self {
         Self {
-            position: Vec3::new(16.0, 80.0, 16.0),
+            position: Vec3::new(2048.0, 200.0, 2048.0),
             yaw: 0.0,
             pitch: -0.3,
             fov_y: 90_f32.to_radians(),

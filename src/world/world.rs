@@ -12,15 +12,16 @@ use crate::{
         mesh::{GpuMesh, Vertex},
     },
     world::{
-        block::{DIRT, STONE},
+        block::{DIRT, STONE, WATER},
         chunk::{Chunk, CHUNK_SIZE},
+        continents::{build_defs, is_land_defs, SEA_LEVEL},
         neighbor::{ChunkFaceData, NeighborMasks},
     },
 };
 
 const DESTROY_LAG: usize = 3;
 const REBUILD_INTERVAL: usize = 30;
-const TERRAIN_HEIGHT: usize = 48;
+const OCEAN_DEPTH: usize = 6;
 
 /// Stage 1: generate block data and extract face mask. No mesh.
 type GenResult = (IVec2, ChunkFaceData);
@@ -42,6 +43,8 @@ pub struct World {
     cpu_meshes: HashMap<IVec2, (Vec<Vertex>, Vec<u32>)>,
     combined: Option<GpuMesh>,
     world_dirty: bool,
+    /// True once the current combined mesh has been promoted to DEVICE_LOCAL VRAM.
+    mesh_in_vram: bool,
     gen_rx: Receiver<GenResult>,
     gen_tx: Sender<GenResult>,
     mesh_rx: Receiver<MeshResult>,
@@ -69,6 +72,7 @@ impl World {
             cpu_meshes: HashMap::new(),
             combined: None,
             world_dirty: false,
+            mesh_in_vram: false,
             gen_rx,
             gen_tx,
             mesh_rx,
@@ -137,6 +141,18 @@ impl World {
             for nb in unblocked {
                 self.pending_mesh.remove(&nb);
                 self.spawn_mesh(nb);
+            }
+        }
+
+        // If gen_in_flight just drained to zero, any surviving pending chunks
+        // can now mesh — the per-result neighbour scan above won't catch them.
+        if self.gen_in_flight.is_empty() && !self.pending_mesh.is_empty() {
+            let stuck: Vec<IVec2> = self.pending_mesh.iter().copied().collect();
+            for coord in stuck {
+                self.pending_mesh.remove(&coord);
+                if !self.mesh_in_flight.contains(&coord) && !self.loaded.contains(&coord) {
+                    self.spawn_mesh(coord);
+                }
             }
         }
 
@@ -238,13 +254,12 @@ impl World {
         }
 
         // ── Rebuild combined mesh ─────────────────────────────────────────────
-        // During loading: HOST_VISIBLE upload (no queue_wait_idle stall, slightly slower GPU reads).
-        // On final settle: DEVICE_LOCAL upload (one stall, then fast GPU reads forever after).
         let settled = self.gen_in_flight.is_empty()
             && self.pending_mesh.is_empty()
             && self.mesh_in_flight.is_empty();
         if self.world_dirty && (settled || self.frame_idx % REBUILD_INTERVAL == 0) {
             self.world_dirty = false;
+            self.mesh_in_vram = false;
             let mut all_verts: Vec<Vertex> = Vec::new();
             let mut all_idxs: Vec<u32> = Vec::new();
             for (verts, idxs) in self.cpu_meshes.values() {
@@ -256,13 +271,30 @@ impl World {
                 self.defer_destroy(old);
             }
             if !all_verts.is_empty() {
-                let mesh = if settled {
-                    GpuMesh::from_data_device_local(&all_verts, &all_idxs, ctx, pool)
-                } else {
-                    GpuMesh::from_data(&all_verts, &all_idxs, ctx, pool)
-                };
+                let mesh = GpuMesh::from_data(&all_verts, &all_idxs, ctx, pool);
                 if let Ok(mesh) = mesh {
                     self.combined = Some(mesh);
+                }
+            }
+        }
+
+        // Once truly settled, promote the host-visible mesh to DEVICE_LOCAL VRAM.
+        // One stall per load batch; mesh_in_vram prevents re-triggering every frame.
+        if settled && !self.world_dirty && !self.mesh_in_vram {
+            self.mesh_in_vram = true; // set first — prevents re-entry even if upload fails
+            let mut all_verts: Vec<Vertex> = Vec::new();
+            let mut all_idxs: Vec<u32> = Vec::new();
+            for (verts, idxs) in self.cpu_meshes.values() {
+                let base = all_verts.len() as u32;
+                all_verts.extend_from_slice(verts);
+                all_idxs.extend(idxs.iter().map(|&i| i + base));
+            }
+            if !all_verts.is_empty() && self.combined.is_some() {
+                if let Ok(vram_mesh) = GpuMesh::from_data_device_local(&all_verts, &all_idxs, ctx, pool) {
+                    // from_data_device_local calls queue_wait_idle, so GPU is idle here.
+                    if let Some(old) = self.combined.replace(vram_mesh) {
+                        old.destroy(ctx);
+                    }
                 }
             }
         }
@@ -314,12 +346,30 @@ fn world_to_chunk(pos: Vec3) -> IVec2 {
 
 fn generate(origin: IVec3) -> Chunk {
     let mut chunk = Chunk::new(origin);
+    let defs = build_defs(origin.x, origin.z);
+
+    // Only fill a shallow band near the surface — the interior stone is never
+    // visible, so filling all the way to Y=0 just wastes meshing iterations.
+    const STONE_DEPTH: usize = 4;
+    let land_base  = SEA_LEVEL - STONE_DEPTH;
+    let ocean_floor = SEA_LEVEL - OCEAN_DEPTH - 1;
+
     for z in 0..CHUNK_SIZE {
         for x in 0..CHUNK_SIZE {
-            for y in 0..TERRAIN_HEIGHT - 1 {
-                chunk.set(x, y, z, STONE);
+            let wx = origin.x + x as i32;
+            let wz = origin.z + z as i32;
+
+            if is_land_defs(&defs, wx, wz) {
+                for y in land_base..SEA_LEVEL {
+                    chunk.set(x, y, z, STONE);
+                }
+                chunk.set(x, SEA_LEVEL, z, DIRT);
+            } else {
+                chunk.set(x, ocean_floor, z, STONE);
+                for y in (ocean_floor + 1)..=SEA_LEVEL {
+                    chunk.set(x, y, z, WATER);
+                }
             }
-            chunk.set(x, TERRAIN_HEIGHT - 1, z, DIRT);
         }
     }
     chunk

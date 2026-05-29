@@ -7,7 +7,15 @@
       "PowerShell(cd C:\\\\Users\\\\kloak\\\\YAVE; $env:RUST_BACKTRACE=1; cargo run 2>&1 | Select-Object -Last 40)",
       "Bash(cargo check *)",
       "Bash(Get-ChildItem -Path \"c:\\\\Users\\\\kloak\\\\YAVE\" -Force)",
-      "Bash(Select-Object Name, PSIsContainer)"
+      "Bash(Select-Object Name, PSIsContainer)",
+      "Bash(cargo build *)",
+      "Bash(Start-Process -FilePath \"C:\\\\Users\\\\kloak\\\\YAVE\\\\target\\\\release\\\\yave.exe\" -WorkingDirectory \"C:\\\\Users\\\\kloak\\\\YAVE\")",
+      "Read(//mnt/c/Users/kloak/**)",
+      "Bash(./target/release/yave.exe)",
+      "Bash(echo \"PID: $!\")",
+      "PowerShell(Start-Process -FilePath \"C:\\\\Users\\\\kloak\\\\YAVE\\\\target\\\\release\\\\yave.exe\" -WorkingDirectory \"C:\\\\Users\\\\kloak\\\\YAVE\")",
+      "PowerShell(Get-Process | Where-Object { $_.MainWindowTitle -ne \"\" } | Select-Object Name, Id, MainWindowTitle | Format-Table -AutoSize)",
+      "PowerShell(Stop-Process -Name \"yave\" -Force -ErrorAction SilentlyContinue)"
     ]
   }
 }

@@ -40,7 +40,7 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec
                         mask[u * v_len + v] = Some(id);
                     } else {
                         // Non-full face (slab sides, etc.): emit using the model's exact geometry
-                        emit_model_face(&mut vertices, &mut indices, face, dir, x, y, z, chunk);
+                        emit_model_face(&mut vertices, &mut indices, face, dir, x, y, z, id, chunk);
                     }
                 }
             }
@@ -68,7 +68,7 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec
                         du += 1;
                     }
 
-                    emit_greedy_quad(&mut vertices, &mut indices, dir, d, u, v, du, dv, chunk);
+                    emit_greedy_quad(&mut vertices, &mut indices, dir, d, u, v, du, dv, chunk, block);
 
                     // Mark the merged rectangle so we don't re-process its cells
                     for uu in u..u + du {
@@ -139,10 +139,12 @@ fn emit_model_face(
     face: &FaceGeometry,
     dir: FaceDir,
     x: usize, y: usize, z: usize,
+    block: BlockId,
     chunk: &Chunk,
 ) {
     let base = vertices.len() as u32;
     let normal = dir.normal();
+    let color = block.0 as f32;
     let (ox, oy, oz) = (
         chunk.origin.x as f32 + x as f32,
         chunk.origin.y as f32 + y as f32,
@@ -152,7 +154,7 @@ fn emit_model_face(
         vertices.push(Vertex {
             pos: [face.verts[i][0] + ox, face.verts[i][1] + oy, face.verts[i][2] + oz],
             normal,
-            uv: face.uvs[i],
+            uv: [color, 0.0],
         });
     }
     indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
@@ -167,6 +169,7 @@ fn emit_greedy_quad(
     d: usize, u: usize, v: usize,
     du: usize, dv: usize,
     chunk: &Chunk,
+    block: BlockId,
 ) {
     let (ox, oy, oz) = (
         chunk.origin.x as f32,
@@ -194,9 +197,9 @@ fn emit_greedy_quad(
 
     let base = vertices.len() as u32;
     let normal = dir.normal();
-    let uvs: [[f32; 2]; 4] = [[0., 0.], [1., 0.], [1., 1.], [0., 1.]];
-    for (pos, uv) in quad.iter().zip(uvs.iter()) {
-        vertices.push(Vertex { pos: *pos, normal, uv: *uv });
+    let color = block.0 as f32;
+    for pos in &quad {
+        vertices.push(Vertex { pos: *pos, normal, uv: [color, 0.0] });
     }
     indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
 }
