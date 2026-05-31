@@ -122,7 +122,7 @@ impl App {
 
         self.fps_frame_count += 1;
         let fps_elapsed = self.fps_last_print.elapsed();
-        if fps_elapsed.as_millis() >= 200 {
+        if fps_elapsed.as_millis() >= 50 {
             let fps = self.fps_frame_count as f64 / fps_elapsed.as_secs_f64();
             println!("FPS: {:.0}", fps);
             self.fps_frame_count = 0;
