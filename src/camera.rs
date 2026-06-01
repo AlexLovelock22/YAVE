@@ -36,6 +36,23 @@ impl Camera {
         Vec3::new(self.yaw.cos(), 0.0, -self.yaw.sin())
     }
 
+    /// Extracts 6 world-space frustum planes from the VP matrix (Gribb-Hartmann method).
+    /// Each plane is [a, b, c, d] where ax+by+cz+d >= 0 for points inside the frustum.
+    pub fn frustum_planes(&self) -> [[f32; 4]; 6] {
+        let m = self.view_proj();
+        let r = [m.row(0), m.row(1), m.row(2), m.row(3)];
+        let p = |a: glam::Vec4, b: glam::Vec4| -> [f32; 4] { (a + b).into() };
+        let q = |a: glam::Vec4, b: glam::Vec4| -> [f32; 4] { (a - b).into() };
+        [
+            p(r[3], r[0]),  // left
+            q(r[3], r[0]),  // right
+            p(r[3], r[1]),  // bottom
+            q(r[3], r[1]),  // top
+            r[2].into(),    // near  (Vulkan Z: 0..1)
+            q(r[3], r[2]),  // far
+        ]
+    }
+
     pub fn view_proj(&self) -> Mat4 {
         let view = Mat4::look_at_rh(self.position, self.position + self.forward(), Vec3::Y);
         let proj = Mat4::perspective_rh(self.fov_y, self.aspect, 0.1, 10000.0);

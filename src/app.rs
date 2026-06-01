@@ -25,6 +25,8 @@ pub struct App {
     cursor_grabbed: bool,
     fps_frame_count: u32,
     fps_last_print: Instant,
+    draw_buf: Vec<(u32, u32)>,
+    title_timer: Instant,
 }
 
 impl App {
@@ -34,7 +36,7 @@ impl App {
         let aspect = size.width as f32 / size.height as f32;
         let camera = Camera::new(aspect);
 
-        let RD = 40;
+        let RD = 80;
         let mut world = World::new(RD);
         world.update(camera.position, &renderer.ctx, renderer.command_pool());
 
@@ -48,6 +50,8 @@ impl App {
             cursor_grabbed: false,
             fps_frame_count: 0,
             fps_last_print: Instant::now(),
+            draw_buf: Vec::new(),
+            title_timer: Instant::now(),
         })
     }
 
@@ -131,9 +135,18 @@ impl App {
 
         self.camera.apply_movement(&self.keys_held, dt);
         self.world.update(self.camera.position, &self.renderer.ctx, self.renderer.command_pool());
-        let meshes: Vec<&_> = self.world.iter_meshes().collect();
+        let planes = self.camera.frustum_planes();
+        self.world.cull_draws(&planes, &mut self.draw_buf);
+
+        if self.title_timer.elapsed().as_millis() >= 100 {
+            self.title_timer = Instant::now();
+            // index_count * 2/3 = vertex count (every quad is 4 verts / 6 indices).
+            let verts: u32 = self.draw_buf.iter().map(|&(_, ic)| ic * 2 / 3).sum();
+            self.window.set_title(&format!("YAVE  |  {} verts  |  {} chunks", verts, self.draw_buf.len()));
+        }
+
         let push = PushConstants { mvp: self.camera.view_proj().to_cols_array_2d() };
-        self.renderer.draw_frame(&meshes, push)
+        self.renderer.draw_frame(self.world.render_buffers(), &self.draw_buf, push)
     }
 }
 

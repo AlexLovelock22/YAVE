@@ -87,6 +87,36 @@ pub fn upload_device_local<T: Copy>(
     Ok((dst_buf, dst_mem))
 }
 
+/// Creates a HOST_VISIBLE staging buffer filled with `data` and a matching DEVICE_LOCAL
+/// destination buffer. Returns (staging_buf, staging_mem, dst_buf, dst_mem).
+/// The caller is responsible for submitting the copy command and freeing staging resources.
+pub fn create_staging_and_dst<T: Copy>(
+    ctx: &VulkanContext,
+    data: &[T],
+    usage: vk::BufferUsageFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory, vk::Buffer, vk::DeviceMemory)> {
+    let size = (std::mem::size_of::<T>() * data.len()) as vk::DeviceSize;
+
+    let (staging_buf, staging_mem) = create_buffer(
+        ctx, size,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    unsafe {
+        let ptr = ctx.device.map_memory(staging_mem, 0, size, vk::MemoryMapFlags::empty())? as *mut T;
+        ptr.copy_from_nonoverlapping(data.as_ptr(), data.len());
+        ctx.device.unmap_memory(staging_mem);
+    }
+
+    let (dst_buf, dst_mem) = create_buffer(
+        ctx, size,
+        usage | vk::BufferUsageFlags::TRANSFER_DST,
+        vk::MemoryPropertyFlags::DEVICE_LOCAL,
+    )?;
+
+    Ok((staging_buf, staging_mem, dst_buf, dst_mem))
+}
+
 /// Uploads `data` into a host-visible buffer (map + memcpy, no staging copy, no GPU stall).
 pub fn upload_via_staging<T: Copy>(
     ctx: &VulkanContext,

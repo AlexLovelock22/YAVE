@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::mem::size_of;
 use std::sync::{mpsc::{self, Receiver, Sender}, Arc};
 use std::time::Instant;
 
@@ -8,8 +9,9 @@ use glam::{IVec2, IVec3, Vec3};
 use crate::{
     meshing::greedy::mesh_chunk,
     render::{
+        buffer::create_buffer,
         context::VulkanContext,
-        mesh::{GpuMesh, Vertex},
+        mesh::{GpuMesh, PendingMeshUpload, Vertex},
     },
     world::{
         block::{DIRT, STONE, WATER},
@@ -25,9 +27,92 @@ const REBUILD_COOLDOWN_MS: u128 = 300;
 
 type GenResult  = (IVec2, ChunkFaceData);
 type MeshResult = (IVec2, Vec<Vertex>, Vec<u32>, u64, u64);
-/// Result of a background assembly: flat vertex + index buffers ready to upload.
-/// Carries assembly_us so the upload log line can show the full pipeline cost.
-type RebuildResult = (Vec<Vertex>, Vec<u32>, u64);
+/// Rayon writes directly into the persistent staging buffers and sends back the byte counts.
+type RebuildResult = (usize, usize, u64); // (vb_bytes, ib_bytes, assemble_us)
+
+/// Per-chunk draw params to commit when a pending upload completes.
+enum DrawUpdate {
+    /// Replace chunk_draws entirely (full rebuild changed the layout).
+    Full(Vec<(IVec2, u32, u32)>),
+    /// Append new entries (incremental builds only add to the end).
+    Incremental(Vec<(IVec2, u32, u32)>),
+}
+
+/// Persistently mapped HOST_VISIBLE staging buffer reused across rebuilds.
+/// Eliminates per-rebuild vkAllocateMemory + vkMapMemory overhead.
+struct StagingBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr:    *mut u8,
+    cap:    usize,
+}
+
+/// Wraps a raw pointer so it can be sent to rayon tasks.
+/// Safety: we guarantee exclusive access while rayon writes (pending_upload guards DMA,
+/// rebuild_pending guards concurrent rayon tasks).
+struct SendPtr(*mut u8);
+unsafe impl Send for SendPtr {}
+impl SendPtr {
+    // Method rather than field access so closures capture `SendPtr` (Send),
+    // not `*mut u8` (!Send) via Rust 2021 field-projection capture.
+    fn get(&self) -> *mut u8 { self.0 }
+}
+
+impl StagingBuffer {
+    fn new(ctx: &VulkanContext, cap: usize) -> anyhow::Result<Self> {
+        let (buffer, memory) = create_buffer(
+            ctx, cap as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let ptr = unsafe {
+            ctx.device.map_memory(memory, 0, cap as vk::DeviceSize, vk::MemoryMapFlags::empty())? as *mut u8
+        };
+        Ok(Self { buffer, memory, ptr, cap })
+    }
+
+    fn ensure_cap(&mut self, ctx: &VulkanContext, needed: usize) -> anyhow::Result<()> {
+        if needed <= self.cap { return Ok(()); }
+        self.destroy(ctx);
+        let new_cap = needed.next_power_of_two().max(needed);
+        *self = Self::new(ctx, new_cap)?;
+        Ok(())
+    }
+
+    fn destroy(&self, ctx: &VulkanContext) {
+        unsafe {
+            ctx.device.unmap_memory(self.memory);
+            ctx.device.destroy_buffer(self.buffer, None);
+            ctx.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Persistent DEVICE_LOCAL render buffer — allocated once, grown only when the mesh
+/// outgrows it. Eliminates per-rebuild vkAllocateMemory on the render thread.
+struct DstBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    cap:    usize,
+}
+
+impl DstBuffer {
+    fn new(ctx: &VulkanContext, cap: usize, usage: vk::BufferUsageFlags) -> anyhow::Result<Self> {
+        let (buffer, memory) = create_buffer(
+            ctx, cap as vk::DeviceSize,
+            usage | vk::BufferUsageFlags::TRANSFER_DST,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        Ok(Self { buffer, memory, cap })
+    }
+
+    fn destroy(&self, ctx: &VulkanContext) {
+        unsafe {
+            ctx.device.destroy_buffer(self.buffer, None);
+            ctx.device.free_memory(self.memory, None);
+        }
+    }
+}
 
 pub struct World {
     render_distance: i32,
@@ -44,6 +129,19 @@ pub struct World {
     last_rebuild:    Instant,
     /// True while a rayon assembly task is running.
     rebuild_pending: bool,
+    /// Dedicated command pool for async mesh transfers (kept alive until World is destroyed).
+    transfer_pool: Option<vk::CommandPool>,
+    /// In-flight GPU upload — rendering continues with the old mesh until the fence signals.
+    pending_upload: Option<PendingMeshUpload>,
+    /// Persistently mapped staging buffers; rayon writes into these directly.
+    staging_vb: Option<StagingBuffer>,
+    staging_ib: Option<StagingBuffer>,
+    /// Double-buffered DEVICE_LOCAL render buffers.
+    /// Uploads always write to dst_[vb|ib][dst_back]; combined reads the other slot.
+    /// The two slots are distinct memory — no DMA/render overlap.
+    dst_vb:   [Option<DstBuffer>; 2],
+    dst_ib:   [Option<DstBuffer>; 2],
+    dst_back: usize,
     gen_rx:    Receiver<GenResult>,
     gen_tx:    Sender<GenResult>,
     mesh_rx:   Receiver<MeshResult>,
@@ -60,6 +158,18 @@ pub struct World {
     total_mesh_us:     u64,
     max_chunk_verts:   usize,
     total_chunk_verts: usize,
+    /// Chunks whose mesh just arrived and haven't been written to staging yet.
+    dirty_new:            Vec<IVec2>,
+    /// When true, staging content is stale (chunks removed) — must full-rebuild.
+    staging_full_rebuild: bool,
+    /// Byte offset of the next free position in the persistent staging buffers.
+    staging_vb_used: usize,
+    staging_ib_used: usize,
+    /// Per-chunk draw parameters for the CURRENT committed GPU layout.
+    /// Stored as a Vec for sequential (cache-friendly) iteration in cull_draws.
+    chunk_draws: Vec<(IVec2, u32, u32)>,
+    /// Draw params for the in-flight upload; committed to chunk_draws when the fence fires.
+    pending_draws: Option<DrawUpdate>,
 }
 
 impl World {
@@ -80,6 +190,13 @@ impl World {
             world_dirty:    false,
             last_rebuild:   Instant::now(),
             rebuild_pending: false,
+            transfer_pool: None,
+            pending_upload: None,
+            staging_vb: None,
+            staging_ib: None,
+            dst_vb:   [None, None],
+            dst_ib:   [None, None],
+            dst_back: 0,
             gen_rx, gen_tx, mesh_rx, mesh_tx, rebuild_rx, rebuild_tx,
             frame_idx: 0,
             deferred: (0..DESTROY_LAG).map(|_| Vec::new()).collect(),
@@ -91,6 +208,12 @@ impl World {
             total_mesh_us:     0,
             max_chunk_verts:   0,
             total_chunk_verts: 0,
+            dirty_new:            Vec::new(),
+            staging_full_rebuild: false,
+            staging_vb_used:      0,
+            staging_ib_used:      0,
+            chunk_draws:          Vec::new(),
+            pending_draws:        None,
         }
     }
 
@@ -175,6 +298,7 @@ impl World {
             self.loaded.insert(coord);
             if !verts.is_empty() {
                 self.cpu_meshes.insert(coord, Arc::new((verts, idxs)));
+                self.dirty_new.push(coord);
                 self.world_dirty = true;
             }
         }
@@ -198,53 +322,257 @@ impl World {
             );
         }
 
-        // ── Receive completed background assembly → GPU upload ────────────────
-        if let Ok((all_verts, all_idxs, assemble_us)) = self.rebuild_rx.try_recv() {
-            self.rebuild_pending = false;
-
-            if let Some(old) = self.combined.take() {
-                self.defer_destroy(old);
+        // ── Poll async GPU upload fence → swap buffers when done ─────────────
+        if let Some(ref upload) = self.pending_upload {
+            if upload.is_ready(ctx) {
+                let upload      = self.pending_upload.take().unwrap();
+                let tpool       = self.transfer_pool.unwrap();
+                let index_count = upload.index_count;
+                let _ = upload.into_mesh(ctx, tpool);
+                let back = self.dst_back;
+                self.combined = Some(GpuMesh::view(
+                    self.dst_vb[back].as_ref().unwrap().buffer,
+                    self.dst_ib[back].as_ref().unwrap().buffer,
+                    index_count,
+                ));
+                self.dst_back = 1 - back;
+                // Commit the draw params that correspond to this new layout.
+                match self.pending_draws.take() {
+                    Some(DrawUpdate::Full(draws))       => { self.chunk_draws = draws; }
+                    Some(DrawUpdate::Incremental(adds)) => { self.chunk_draws.extend(adds); }
+                    None => {}
+                }
+                let total_verts = self.staging_vb_used / size_of::<Vertex>();
+                println!("[mesh] swapped  total_verts={total_verts}  chunks={}", self.chunk_draws.len());
             }
-            if !all_verts.is_empty() {
+        }
+
+        // ── Receive completed rayon write → submit async GPU copy ────────────
+        if let Ok((vb_bytes, ib_bytes, assemble_us)) = self.rebuild_rx.try_recv() {
+            self.rebuild_pending = false;
+            self.staging_vb_used = vb_bytes;
+            self.staging_ib_used = ib_bytes;
+            if vb_bytes > 0 {
+                let tpool = *self.transfer_pool.get_or_insert_with(|| unsafe {
+                    ctx.device.create_command_pool(&vk::CommandPoolCreateInfo {
+                        flags: vk::CommandPoolCreateFlags::TRANSIENT,
+                        queue_family_index: ctx.graphics_family,
+                        ..Default::default()
+                    }, None).expect("transfer pool")
+                });
+
+                // Write to the back slot only; front slot is being rendered, never touched here.
+                let back = self.dst_back;
+                let need_grow_vb = self.dst_vb[back].as_ref().map_or(true, |b| vb_bytes > b.cap);
+                let need_grow_ib = self.dst_ib[back].as_ref().map_or(true, |b| ib_bytes > b.cap);
+
+                if need_grow_vb {
+                    let cap = vb_bytes.next_power_of_two();
+                    if let Some(old) = self.dst_vb[back].take() {
+                        // Slot was previously the front (rendered). Defer-destroy for GPU safety.
+                        self.defer_destroy(GpuMesh {
+                            vertex_buffer: old.buffer, vertex_memory: old.memory,
+                            index_buffer:  vk::Buffer::null(), index_memory: vk::DeviceMemory::null(),
+                            index_count:   0,
+                        });
+                    }
+                    match DstBuffer::new(ctx, cap, vk::BufferUsageFlags::VERTEX_BUFFER) {
+                        Ok(b) => self.dst_vb[back] = Some(b),
+                        Err(e) => { eprintln!("[mesh] dst_vb[{back}] grow: {e}"); return; }
+                    }
+                }
+                if need_grow_ib {
+                    let cap = ib_bytes.next_power_of_two();
+                    if let Some(old) = self.dst_ib[back].take() {
+                        self.defer_destroy(GpuMesh {
+                            vertex_buffer: vk::Buffer::null(), vertex_memory: old.memory,
+                            index_buffer:  old.buffer, index_memory: vk::DeviceMemory::null(),
+                            index_count:   0,
+                        });
+                    }
+                    match DstBuffer::new(ctx, cap, vk::BufferUsageFlags::INDEX_BUFFER) {
+                        Ok(b) => self.dst_ib[back] = Some(b),
+                        Err(e) => { eprintln!("[mesh] dst_ib[{back}] grow: {e}"); return; }
+                    }
+                }
+
+                let staging_vb = self.staging_vb.as_ref().unwrap().buffer;
+                let staging_ib = self.staging_ib.as_ref().unwrap().buffer;
+                let dst_vb     = self.dst_vb[back].as_ref().unwrap().buffer;
+                let dst_ib     = self.dst_ib[back].as_ref().unwrap().buffer;
                 let t = Instant::now();
-                if let Ok(mesh) = GpuMesh::from_data_device_local(&all_verts, &all_idxs, ctx, pool) {
-                    let upload_us = t.elapsed().as_micros() as u64;
-                    println!(
-                        "[mesh] verts={}  assemble={}us  upload={}us  total={}ms",
-                        all_verts.len(), assemble_us, upload_us,
-                        (assemble_us + upload_us) / 1000,
-                    );
-                    self.combined = Some(mesh);
+                match GpuMesh::begin_copy_to_preallocated(
+                    staging_vb, vb_bytes,
+                    staging_ib, ib_bytes,
+                    dst_vb, dst_ib,
+                    ctx, tpool,
+                ) {
+                    Ok(upload) => {
+                        println!("[mesh] assemble={}us  submit={}us  verts={}",
+                            assemble_us, t.elapsed().as_micros(),
+                            vb_bytes / size_of::<Vertex>());
+                        self.pending_upload = Some(upload);
+                    }
+                    Err(e) => eprintln!("[mesh] copy submit failed: {e}"),
                 }
             }
         }
 
         // ── Trigger background assembly ───────────────────────────────────────
-        // Also re-run when camera has been still long enough to earn a VRAM promotion.
         let cooldown_ok    = self.last_rebuild.elapsed().as_millis() >= REBUILD_COOLDOWN_MS;
-        let should_rebuild = self.world_dirty && cooldown_ok;
+        // Don't start a new rebuild while DMA is still reading from staging.
+        let should_rebuild = self.world_dirty && cooldown_ok && self.pending_upload.is_none();
 
         if should_rebuild && !self.rebuild_pending {
-            self.world_dirty     = false;
-            self.last_rebuild    = Instant::now();
-            self.rebuild_pending = true;
+            // First rebuild or chunks were removed → must rewrite all of staging.
+            let do_full = self.staging_full_rebuild || self.staging_vb_used == 0;
 
-            // Snapshot Arc refs — O(chunks), not O(vertices).
-            let snapshot: Vec<Arc<(Vec<Vertex>, Vec<u32>)>> =
-                self.cpu_meshes.values().cloned().collect();
-            let tx = self.rebuild_tx.clone();
+            if do_full {
+                let vb_needed: usize = self.cpu_meshes.values().map(|c| c.0.len()).sum::<usize>() * size_of::<Vertex>();
+                let ib_needed: usize = self.cpu_meshes.values().map(|c| c.1.len()).sum::<usize>() * size_of::<u32>();
 
-            rayon::spawn(move || {
-                let t = Instant::now();
-                let mut all_verts: Vec<Vertex> = Vec::new();
-                let mut all_idxs:  Vec<u32>    = Vec::new();
-                for chunk in &snapshot {
-                    let base = all_verts.len() as u32;
-                    all_verts.extend_from_slice(&chunk.0);
-                    all_idxs.extend(chunk.1.iter().map(|&i| i + base));
+                let vb_ok = self.staging_vb.get_or_insert_with(|| {
+                    StagingBuffer::new(ctx, vb_needed.next_power_of_two()).expect("staging vb alloc")
+                }).ensure_cap(ctx, vb_needed).is_ok();
+                let ib_ok = self.staging_ib.get_or_insert_with(|| {
+                    StagingBuffer::new(ctx, ib_needed.next_power_of_two()).expect("staging ib alloc")
+                }).ensure_cap(ctx, ib_needed).is_ok();
+
+                if vb_ok && ib_ok {
+                    self.world_dirty          = false;
+                    self.staging_full_rebuild = false;
+                    self.last_rebuild         = Instant::now();
+                    self.rebuild_pending      = true;
+                    self.dirty_new.clear();
+
+                    // Snapshot preserves a stable write order; we derive per-chunk draw params
+                    // from that order on the main thread so rayon just does the memcpy work.
+                    let snapshot: Vec<(IVec2, Arc<(Vec<Vertex>, Vec<u32>)>)> =
+                        self.cpu_meshes.iter().map(|(&k, v)| (k, v.clone())).collect();
+
+                    let mut new_draws = Vec::with_capacity(snapshot.len());
+                    {
+                        let mut first_idx = 0u32;
+                        for (coord, mesh) in &snapshot {
+                            let ic = mesh.1.len() as u32;
+                            new_draws.push((*coord, first_idx, ic));
+                            first_idx += ic;
+                        }
+                    }
+                    self.pending_draws = Some(DrawUpdate::Full(new_draws));
+
+                    let snapshot_data: Vec<Arc<(Vec<Vertex>, Vec<u32>)>> =
+                        snapshot.into_iter().map(|(_, m)| m).collect();
+                    let tx     = self.rebuild_tx.clone();
+                    let vb_ptr = SendPtr(self.staging_vb.as_ref().unwrap().ptr);
+                    let ib_ptr = SendPtr(self.staging_ib.as_ref().unwrap().ptr);
+
+                    rayon::spawn(move || {
+                        let t = Instant::now();
+                        let mut vb_off      = 0usize;
+                        let mut ib_off      = 0usize;
+                        let mut base_vertex = 0u32;
+                        for chunk in &snapshot_data {
+                            let (verts, idxs) = chunk.as_ref();
+                            let v_bytes = verts.len() * size_of::<Vertex>();
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    verts.as_ptr() as *const u8,
+                                    vb_ptr.get().add(vb_off),
+                                    v_bytes,
+                                );
+                            }
+                            vb_off += v_bytes;
+                            let idx_dst = unsafe { ib_ptr.get().add(ib_off) as *mut u32 };
+                            for (j, &i) in idxs.iter().enumerate() {
+                                unsafe { *idx_dst.add(j) = i + base_vertex; }
+                            }
+                            ib_off      += idxs.len() * size_of::<u32>();
+                            base_vertex += verts.len() as u32;
+                        }
+                        let _ = tx.send((vb_off, ib_off, t.elapsed().as_micros() as u64));
+                    });
                 }
-                let _ = tx.send((all_verts, all_idxs, t.elapsed().as_micros() as u64));
-            });
+            } else {
+                // Incremental: only write the newly arrived chunks, leave old staging data untouched.
+                let mut cur_vb = self.staging_vb_used;
+                let mut cur_ib = self.staging_ib_used;
+                let mut cur_bv = (self.staging_vb_used / size_of::<Vertex>()) as u32;
+
+                let dirty = &self.dirty_new;
+                let cpu   = &self.cpu_meshes;
+                // Include coord so we can compute draw params before handing off to rayon.
+                let to_append: Vec<(IVec2, Arc<(Vec<Vertex>, Vec<u32>)>, usize, usize, u32)> =
+                    dirty.iter()
+                        .filter_map(|&c| cpu.get(&c).map(|m| {
+                            let entry = (c, m.clone(), cur_vb, cur_ib, cur_bv);
+                            cur_vb += m.0.len() * size_of::<Vertex>();
+                            cur_ib += m.1.len() * size_of::<u32>();
+                            cur_bv += m.0.len() as u32;
+                            entry
+                        }))
+                        .collect();
+
+                let new_vb_total = cur_vb;
+                let new_ib_total = cur_ib;
+
+                // If staging needs to grow the old data is gone → fall back to full rebuild.
+                let needs_vb_realloc = self.staging_vb.as_ref().map_or(true, |s| new_vb_total > s.cap);
+                let needs_ib_realloc = self.staging_ib.as_ref().map_or(true, |s| new_ib_total > s.cap);
+
+                if needs_vb_realloc || needs_ib_realloc {
+                    self.staging_full_rebuild = true;
+                } else if to_append.is_empty() {
+                    // All dirty_new chunks were unloaded before the rebuild fired.
+                    self.world_dirty = false;
+                    self.dirty_new.clear();
+                } else {
+                    self.staging_vb_used  = new_vb_total;
+                    self.staging_ib_used  = new_ib_total;
+                    self.world_dirty      = false;
+                    self.last_rebuild     = Instant::now();
+                    self.rebuild_pending  = true;
+                    self.dirty_new.clear();
+
+                    // Compute per-chunk draw params for the new chunks.
+                    let inc_draws: Vec<(IVec2, u32, u32)> = to_append.iter()
+                        .map(|(coord, mesh, _, ib_off, _)| {
+                            let fi = (*ib_off / size_of::<u32>()) as u32;
+                            let ic = mesh.1.len() as u32;
+                            (*coord, fi, ic)
+                        })
+                        .collect();
+                    self.pending_draws = Some(DrawUpdate::Incremental(inc_draws));
+
+                    // Strip coord before handing to rayon (it only needs the data + offsets).
+                    let rayon_work: Vec<(Arc<(Vec<Vertex>, Vec<u32>)>, usize, usize, u32)> =
+                        to_append.into_iter().map(|(_, m, a, b, c)| (m, a, b, c)).collect();
+
+                    let tx     = self.rebuild_tx.clone();
+                    let vb_ptr = SendPtr(self.staging_vb.as_ref().unwrap().ptr);
+                    let ib_ptr = SendPtr(self.staging_ib.as_ref().unwrap().ptr);
+
+                    rayon::spawn(move || {
+                        let t = Instant::now();
+                        for (mesh, vb_off, ib_off, base_v) in &rayon_work {
+                            let (verts, idxs) = mesh.as_ref();
+                            let v_bytes = verts.len() * size_of::<Vertex>();
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    verts.as_ptr() as *const u8,
+                                    vb_ptr.get().add(*vb_off),
+                                    v_bytes,
+                                );
+                            }
+                            let idx_dst = unsafe { ib_ptr.get().add(*ib_off) as *mut u32 };
+                            for (j, &i) in idxs.iter().enumerate() {
+                                unsafe { *idx_dst.add(j) = i + base_v; }
+                            }
+                        }
+                        let _ = tx.send((new_vb_total, new_ib_total, t.elapsed().as_micros() as u64));
+                    });
+                }
+            }
         }
 
         // ── O(RD²) load/unload scan on chunk boundary ─────────────────────────
@@ -255,6 +583,8 @@ impl World {
             self.loaded.retain(|c| (c.x - cam_chunk.x).abs() <= rd && (c.y - cam_chunk.y).abs() <= rd);
             if self.loaded.len() != before {
                 self.cpu_meshes.retain(|c, _| self.loaded.contains(c));
+                self.chunk_draws.retain(|(c, _, _)| self.loaded.contains(c));
+                self.staging_full_rebuild = true;
                 self.world_dirty = true;
             }
 
@@ -312,16 +642,57 @@ impl World {
         }
     }
 
-    pub fn iter_meshes(&self) -> impl Iterator<Item = &GpuMesh> {
-        self.combined.iter()
+    /// Combined vertex and index buffer handles for the current committed GPU layout.
+    pub fn render_buffers(&self) -> Option<(vk::Buffer, vk::Buffer)> {
+        self.combined.as_ref().map(|m| (m.vertex_buffer, m.index_buffer))
+    }
+
+    /// Fills `out` with (first_index, index_count) for every chunk whose AABB passes
+    /// all 6 frustum planes.  Clears `out` first so the caller can reuse the allocation.
+    pub fn cull_draws(&self, planes: &[[f32; 4]; 6], out: &mut Vec<(u32, u32)>) {
+        out.clear();
+        for &(coord, fi, ic) in &self.chunk_draws {
+            if chunk_in_frustum(coord, planes) {
+                out.push((fi, ic));
+            }
+        }
     }
 
     pub fn destroy(&mut self, ctx: &VulkanContext) {
         for bucket in &mut self.deferred {
             for mesh in bucket.drain(..) { mesh.destroy(ctx); }
         }
-        if let Some(mesh) = self.combined.take() { mesh.destroy(ctx); }
+        if let Some(upload) = self.pending_upload.take() {
+            if let Some(pool) = self.transfer_pool {
+                upload.abort(ctx, pool); // blocks briefly to let GPU finish
+            }
+        }
+        // combined is a non-owning view; no need to destroy it.
+        self.combined = None;
+        if let Some(pool) = self.transfer_pool.take() {
+            unsafe { ctx.device.destroy_command_pool(pool, None); }
+        }
+        if let Some(s) = self.staging_vb.take() { s.destroy(ctx); }
+        if let Some(s) = self.staging_ib.take() { s.destroy(ctx); }
+        for slot in &mut self.dst_vb { if let Some(b) = slot.take() { b.destroy(ctx); } }
+        for slot in &mut self.dst_ib { if let Some(b) = slot.take() { b.destroy(ctx); } }
     }
+}
+
+/// AABB frustum test for a single chunk.  Returns false if the chunk is entirely
+/// outside any of the 6 planes (p-vertex / positive-vertex test).
+fn chunk_in_frustum(coord: IVec2, planes: &[[f32; 4]; 6]) -> bool {
+    let min_x = coord.x as f32 * CHUNK_SIZE as f32;
+    let min_z = coord.y as f32 * CHUNK_SIZE as f32;
+    let max_x = min_x + CHUNK_SIZE as f32;
+    let max_z = min_z + CHUNK_SIZE as f32;
+    for &[a, b, c, d] in planes {
+        let px = if a >= 0.0 { max_x } else { min_x };
+        let py = if b >= 0.0 { 256.0_f32 } else { 0.0_f32 };
+        let pz = if c >= 0.0 { max_z } else { min_z };
+        if a * px + b * py + c * pz + d < 0.0 { return false; }
+    }
+    true
 }
 
 fn can_mesh(coord: IVec2, gen_in_flight: &HashSet<IVec2>) -> bool {

@@ -4,7 +4,7 @@ use bytemuck::bytes_of;
 
 use super::{
     context::VulkanContext,
-    mesh::{GpuMesh, PushConstants},
+    mesh::PushConstants,
     pipeline::{self, Pipeline},
     swapchain::{self, Swapchain},
 };
@@ -86,7 +86,12 @@ impl Renderer {
         })
     }
 
-    pub fn draw_frame(&mut self, meshes: &[&GpuMesh], push: PushConstants) -> Result<()> {
+    pub fn draw_frame(
+        &mut self,
+        render_bufs: Option<(vk::Buffer, vk::Buffer)>,
+        draws: &[(u32, u32)],
+        push: PushConstants,
+    ) -> Result<()> {
         let fences = [self.in_flight[self.current_frame]];
         unsafe { self.ctx.device.wait_for_fences(&fences, true, u64::MAX)? };
 
@@ -119,7 +124,8 @@ impl Renderer {
             cmd,
             &self.swapchain,
             &self.pipeline,
-            meshes,
+            render_bufs,
+            draws,
             push,
             image_index as usize,
         )?;
@@ -204,7 +210,8 @@ fn record_command_buffer(
     cmd: vk::CommandBuffer,
     sc: &Swapchain,
     pipeline: &Pipeline,
-    meshes: &[&GpuMesh],
+    render_bufs: Option<(vk::Buffer, vk::Buffer)>,
+    draws: &[(u32, u32)],
     push: PushConstants,
     image_index: usize,
 ) -> Result<()> {
@@ -266,12 +273,12 @@ fn record_command_buffer(
             bytes_of(&push),
         );
 
-        for mesh in meshes {
-            ctx.device
-                .cmd_bind_vertex_buffers(cmd, 0, &[mesh.vertex_buffer], &[0]);
-            ctx.device
-                .cmd_bind_index_buffer(cmd, mesh.index_buffer, 0, vk::IndexType::UINT32);
-            ctx.device.cmd_draw_indexed(cmd, mesh.index_count, 1, 0, 0, 0);
+        if let Some((vb, ib)) = render_bufs {
+            ctx.device.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
+            ctx.device.cmd_bind_index_buffer(cmd, ib, 0, vk::IndexType::UINT32);
+            for &(first_index, index_count) in draws {
+                ctx.device.cmd_draw_indexed(cmd, index_count, 1, first_index, 0, 0);
+            }
         }
         ctx.device.cmd_end_render_pass(cmd);
         ctx.device.end_command_buffer(cmd)?;
