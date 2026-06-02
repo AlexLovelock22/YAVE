@@ -14,7 +14,7 @@ const MAX_ASPECT: f32 = 1.5;
 
 // A continent's "value" (dome) is summed across the 3×3 cell neighbourhood.
 // Land when sum >= CONT_THRESHOLD.
-const CONT_THRESHOLD: f32 = 0.18;
+pub const CONT_THRESHOLD: f32 = 0.18;
 
 // Large-scale domain warp (bulges, flat edges, the "African lean").
 const WARP1_AMP_FACTOR: f32    = 0.35;

@@ -4,186 +4,264 @@ use crate::{
     world::{
         block::{face_tex, get_model, BlockId},
         chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE},
-        neighbor::{mask_solid, NeighborMasks},
+        neighbor::{mask_solid, NeighborMasks, FACE_BYTES},
     },
 };
 
-/// LOD variant: same greedy algorithm but sampled at `scale`-block intervals.
-/// Uses neighbour masks at chunk boundaries to avoid tall wall faces at the render edge.
-pub fn mesh_chunk_lod(chunk: &Chunk, neighbors: &NeighborMasks, scale: usize) -> (Vec<Vertex>, Vec<u32>) {
-    debug_assert!(scale > 1 && CHUNK_SIZE % scale == 0);
+/// Surface-only LOD mesh for medium-distance chunks.
+///
+/// Builds a per-column heightfield and emits only the topmost face of each column
+/// plus cliff side-faces where adjacent columns differ in height. Blocks are rendered
+/// at full 1×1×1 world-unit resolution, so the result looks identical to mesh_chunk
+/// for solid heightmap terrain. The savings vs mesh_chunk come from iterating
+/// CHUNK_SIZE² columns instead of the full 3D block volume.
+pub fn mesh_chunk_surface(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices  = Vec::new();
+    let cs = CHUNK_SIZE;
+    let mh = chunk.max_height;
 
-    let cs = CHUNK_SIZE   / scale;
-    let ch = CHUNK_HEIGHT / scale;
-    let mh = ((chunk.max_height / scale) + 1).min(ch);
-
-    for dir in FaceDir::ALL {
-        if dir == FaceDir::NegY { continue; }
-        let (dl, ul, vl) = match dir {
-            FaceDir::PosX | FaceDir::NegX => (cs, mh, cs),
-            FaceDir::PosY | FaceDir::NegY => (mh, cs, cs),
-            FaceDir::PosZ | FaceDir::NegZ => (cs, cs, mh),
-        };
-
-        let mut mask = vec![None::<BlockId>; ul * vl];
-        let mut used = vec![false;          ul * vl];
-
-        for d in 0..dl {
-            mask.fill(None);
-            used.fill(false);
-
-            for u in 0..ul {
-                for v in 0..vl {
-                    let (bx, by_base, bz) = to_xyz(dir, d * scale, u * scale, v * scale);
-                    if bx >= CHUNK_SIZE || by_base >= CHUNK_HEIGHT || bz >= CHUNK_SIZE { continue; }
-
-                    // For PosY (top faces), coarse sampling can skip a thin surface layer
-                    // (e.g. a single dirt block at an odd y with stone below at even y).
-                    // Scan the full meta-cell range and use the topmost solid block.
-                    let (id, by) = if dir == FaceDir::PosY {
-                        let end = (by_base + scale).min(CHUNK_HEIGHT);
-                        let mut found = None;
-                        for y in (by_base..end).rev() {
-                            let b = chunk.get(bx, y, bz);
-                            if get_model(b).is_some() { found = Some((b, y)); break; }
-                        }
-                        match found { Some(p) => p, None => continue }
-                    } else {
-                        let b = chunk.get(bx, by_base, bz);
-                        if get_model(b).is_none() { continue; }
-                        (b, by_base)
-                    };
-
-                    let Some(model) = get_model(id) else { continue };
-                    // Only full faces participate in greedy merging at LOD; skip sub-block models.
-                    if model.face(dir).map(|f| !f.is_full).unwrap_or(true) { continue; }
-                    if !lod_exposed(chunk, neighbors, bx, by, bz, dir, scale) { continue; }
-
-                    mask[u * vl + v] = Some(id);
-                }
-            }
-
-            for u in 0..ul {
-                for v in 0..vl {
-                    let i = u * vl + v;
-                    if used[i] || mask[i].is_none() { continue; }
-                    let block = mask[i].unwrap();
-
-                    let mut dv = 1;
-                    while v + dv < vl && mask[u * vl + v + dv] == Some(block) { dv += 1; }
-
-                    let mut du = 1;
-                    'expand: loop {
-                        if u + du >= ul { break; }
-                        for vv in v..v + dv {
-                            if mask[(u + du) * vl + vv] != Some(block) { break 'expand; }
-                        }
-                        du += 1;
-                    }
-
-                    emit_greedy_quad_scaled(
-                        &mut vertices, &mut indices,
-                        dir, d, u, v, du, dv, scale, chunk, block,
-                    );
-
-                    for uu in u..u + du {
-                        for vv in v..v + dv {
-                            used[uu * vl + vv] = true;
-                        }
-                    }
+    // ── Per-column surface: (block_id, y) of topmost solid block ─────────────
+    let mut surf = vec![None::<(BlockId, usize)>; cs * cs];
+    for x in 0..cs {
+        for z in 0..cs {
+            for y in (0..=mh).rev() {
+                let b = chunk.get(x, y, z);
+                if get_model(b).is_some() {
+                    surf[x * cs + z] = Some((b, y));
+                    break;
                 }
             }
         }
     }
+
+    // Column height as i32 (-1 = empty/air column).
+    let surf_h = |x: usize, z: usize| -> i32 {
+        surf[x * cs + z].map_or(-1, |(_, y)| y as i32)
+    };
+
+    // Topmost solid y in a neighbor face-mask (-1 = empty column in that neighbor).
+    let face_top = |face_mask: &[u8; FACE_BYTES], lateral: usize| -> i32 {
+        for y in (0..CHUNK_HEIGHT).rev() {
+            if mask_solid(face_mask, y, lateral) { return y as i32; }
+        }
+        -1
+    };
+
+    // ── PosY: top face of each column, 2D greedy merge on (x, z) ─────────────
+    // Two cells can merge only if same block type AND same surface height (flat quad).
+    {
+        let mut used = vec![false; cs * cs];
+        for x in 0..cs {
+            for z in 0..cs {
+                let i = x * cs + z;
+                if used[i] { continue; }
+                let Some((block, y0)) = surf[i] else { continue };
+
+                let mut dz = 1;
+                while z + dz < cs {
+                    match surf[x * cs + z + dz] {
+                        Some((b, y)) if b == block && y == y0 => dz += 1,
+                        _ => break,
+                    }
+                }
+                let mut dx = 1;
+                'ex: loop {
+                    if x + dx >= cs { break; }
+                    for zz in z..z + dz {
+                        match surf[(x + dx) * cs + zz] {
+                            Some((b, y)) if b == block && y == y0 => {}
+                            _ => break 'ex,
+                        }
+                    }
+                    dx += 1;
+                }
+                // PosY: d=y, u=x, v=z
+                emit_greedy_quad(&mut vertices, &mut indices, FaceDir::PosY, y0, x, z, dx, dz, chunk, block);
+                for xx in x..x + dx {
+                    for zz in z..z + dz { used[xx * cs + zz] = true; }
+                }
+            }
+        }
+    }
+
+    // ── Cliff side faces ──────────────────────────────────────────────────────
+    // For each direction, build a per-depth-layer mask of exposed cliff cells
+    // and greedy-merge in (lateral, y) space.
+    //
+    // Mask layout: mask[lat * row + y]
+    //   PosX / NegX: lat = z,  y = height  →  emit(dir, d=x, u=y, v=z, du, dv)
+    //   PosZ / NegZ: lat = x,  y = height  →  emit(dir, d=z, u=x, v=y, du_lat, dv_y)
+    let row = mh + 1;
+    let mut mask = vec![None::<BlockId>; cs * row];
+    let mut used = vec![false; cs * row];
+
+    // PosX ────────────────────────────────────────────────────────────────────
+    for d in 0..cs {
+        mask.fill(None);
+        used.fill(false);
+        for lat in 0..cs {
+            let th = surf_h(d, lat);
+            if th < 0 { continue; }
+            let nh = if d + 1 < cs {
+                surf_h(d + 1, lat)
+            } else {
+                neighbors.pos_x.as_ref().map_or(th, |m| face_top(m, lat))
+            };
+            let start = (nh + 1).max(0) as usize;
+            for y in start..=th as usize {
+                let b = chunk.get(d, y, lat);
+                if get_model(b).is_some() { mask[lat * row + y] = Some(b); }
+            }
+        }
+        for lat in 0..cs {
+            for y in 0..row {
+                let i = lat * row + y;
+                if used[i] || mask[i].is_none() { continue; }
+                let block = mask[i].unwrap();
+                let mut dy = 1;
+                while y + dy < row && mask[lat * row + y + dy] == Some(block) { dy += 1; }
+                let mut dlat = 1;
+                'ex: loop {
+                    if lat + dlat >= cs { break; }
+                    for yy in y..y + dy {
+                        if mask[(lat + dlat) * row + yy] != Some(block) { break 'ex; }
+                    }
+                    dlat += 1;
+                }
+                emit_greedy_quad(&mut vertices, &mut indices, FaceDir::PosX, d, y, lat, dy, dlat, chunk, block);
+                for ll in lat..lat + dlat {
+                    for yy in y..y + dy { used[ll * row + yy] = true; }
+                }
+            }
+        }
+    }
+
+    // NegX ────────────────────────────────────────────────────────────────────
+    for d in 0..cs {
+        mask.fill(None);
+        used.fill(false);
+        for lat in 0..cs {
+            let th = surf_h(d, lat);
+            if th < 0 { continue; }
+            let nh = if d > 0 {
+                surf_h(d - 1, lat)
+            } else {
+                neighbors.neg_x.as_ref().map_or(th, |m| face_top(m, lat))
+            };
+            let start = (nh + 1).max(0) as usize;
+            for y in start..=th as usize {
+                let b = chunk.get(d, y, lat);
+                if get_model(b).is_some() { mask[lat * row + y] = Some(b); }
+            }
+        }
+        for lat in 0..cs {
+            for y in 0..row {
+                let i = lat * row + y;
+                if used[i] || mask[i].is_none() { continue; }
+                let block = mask[i].unwrap();
+                let mut dy = 1;
+                while y + dy < row && mask[lat * row + y + dy] == Some(block) { dy += 1; }
+                let mut dlat = 1;
+                'ex: loop {
+                    if lat + dlat >= cs { break; }
+                    for yy in y..y + dy {
+                        if mask[(lat + dlat) * row + yy] != Some(block) { break 'ex; }
+                    }
+                    dlat += 1;
+                }
+                emit_greedy_quad(&mut vertices, &mut indices, FaceDir::NegX, d, y, lat, dy, dlat, chunk, block);
+                for ll in lat..lat + dlat {
+                    for yy in y..y + dy { used[ll * row + yy] = true; }
+                }
+            }
+        }
+    }
+
+    // PosZ ────────────────────────────────────────────────────────────────────
+    // lat = x; emit(PosZ, d=z, u=lat=x, v=y, du=dlat, dv=dy)
+    for d in 0..cs {
+        mask.fill(None);
+        used.fill(false);
+        for lat in 0..cs {
+            let th = surf_h(lat, d);
+            if th < 0 { continue; }
+            let nh = if d + 1 < cs {
+                surf_h(lat, d + 1)
+            } else {
+                neighbors.pos_z.as_ref().map_or(th, |m| face_top(m, lat))
+            };
+            let start = (nh + 1).max(0) as usize;
+            for y in start..=th as usize {
+                let b = chunk.get(lat, y, d);
+                if get_model(b).is_some() { mask[lat * row + y] = Some(b); }
+            }
+        }
+        for lat in 0..cs {
+            for y in 0..row {
+                let i = lat * row + y;
+                if used[i] || mask[i].is_none() { continue; }
+                let block = mask[i].unwrap();
+                let mut dy = 1;
+                while y + dy < row && mask[lat * row + y + dy] == Some(block) { dy += 1; }
+                let mut dlat = 1;
+                'ex: loop {
+                    if lat + dlat >= cs { break; }
+                    for yy in y..y + dy {
+                        if mask[(lat + dlat) * row + yy] != Some(block) { break 'ex; }
+                    }
+                    dlat += 1;
+                }
+                emit_greedy_quad(&mut vertices, &mut indices, FaceDir::PosZ, d, lat, y, dlat, dy, chunk, block);
+                for ll in lat..lat + dlat {
+                    for yy in y..y + dy { used[ll * row + yy] = true; }
+                }
+            }
+        }
+    }
+
+    // NegZ ────────────────────────────────────────────────────────────────────
+    for d in 0..cs {
+        mask.fill(None);
+        used.fill(false);
+        for lat in 0..cs {
+            let th = surf_h(lat, d);
+            if th < 0 { continue; }
+            let nh = if d > 0 {
+                surf_h(lat, d - 1)
+            } else {
+                neighbors.neg_z.as_ref().map_or(th, |m| face_top(m, lat))
+            };
+            let start = (nh + 1).max(0) as usize;
+            for y in start..=th as usize {
+                let b = chunk.get(lat, y, d);
+                if get_model(b).is_some() { mask[lat * row + y] = Some(b); }
+            }
+        }
+        for lat in 0..cs {
+            for y in 0..row {
+                let i = lat * row + y;
+                if used[i] || mask[i].is_none() { continue; }
+                let block = mask[i].unwrap();
+                let mut dy = 1;
+                while y + dy < row && mask[lat * row + y + dy] == Some(block) { dy += 1; }
+                let mut dlat = 1;
+                'ex: loop {
+                    if lat + dlat >= cs { break; }
+                    for yy in y..y + dy {
+                        if mask[(lat + dlat) * row + yy] != Some(block) { break 'ex; }
+                    }
+                    dlat += 1;
+                }
+                emit_greedy_quad(&mut vertices, &mut indices, FaceDir::NegZ, d, lat, y, dlat, dy, chunk, block);
+                for ll in lat..lat + dlat {
+                    for yy in y..y + dy { used[ll * row + yy] = true; }
+                }
+            }
+        }
+    }
+
     (vertices, indices)
-}
-
-/// Exposure check for LOD meshes: checks the adjacent meta-block inside the same chunk,
-/// or uses neighbour masks at chunk boundaries (treats missing neighbour as solid).
-fn lod_exposed(chunk: &Chunk, neighbors: &NeighborMasks, bx: usize, by: usize, bz: usize, dir: FaceDir, s: usize) -> bool {
-    match dir {
-        FaceDir::PosX => {
-            let nx = bx + s;
-            if nx >= CHUNK_SIZE {
-                return neighbors.pos_x.as_ref().map_or(false, |m| !mask_solid(m, by, bz));
-            }
-            get_model(chunk.get(nx, by, bz)).is_none()
-        }
-        FaceDir::NegX => {
-            if bx < s {
-                return neighbors.neg_x.as_ref().map_or(false, |m| !mask_solid(m, by, bz));
-            }
-            get_model(chunk.get(bx - s, by, bz)).is_none()
-        }
-        FaceDir::PosY => {
-            for dy in 1..=s {
-                let ny = by + dy;
-                if ny >= CHUNK_HEIGHT { return true; }
-                if get_model(chunk.get(bx, ny, bz)).is_some() { return false; }
-            }
-            true
-        }
-        FaceDir::NegY => {
-            if by < s { return true; }
-            get_model(chunk.get(bx, by - s, bz)).is_none()
-        }
-        FaceDir::PosZ => {
-            let nz = bz + s;
-            if nz >= CHUNK_SIZE {
-                return neighbors.pos_z.as_ref().map_or(false, |m| !mask_solid(m, by, bx));
-            }
-            get_model(chunk.get(bx, by, nz)).is_none()
-        }
-        FaceDir::NegZ => {
-            if bz < s {
-                return neighbors.neg_z.as_ref().map_or(false, |m| !mask_solid(m, by, bx));
-            }
-            get_model(chunk.get(bx, by, bz - s)).is_none()
-        }
-    }
-}
-
-/// Like `emit_greedy_quad` but multiplies all coordinates by `scale` so the quad covers
-/// `scale` world units per meta-block unit.
-fn emit_greedy_quad_scaled(
-    vertices: &mut Vec<Vertex>,
-    indices:  &mut Vec<u32>,
-    dir: FaceDir,
-    d: usize, u: usize, v: usize,
-    du: usize, dv: usize,
-    scale: usize,
-    chunk: &Chunk,
-    block: BlockId,
-) {
-    let s  = scale as f32;
-    let (ox, oy, oz) = (chunk.origin.x as f32, chunk.origin.y as f32, chunk.origin.z as f32);
-    let (d, u, v, du, dv) = (d as f32 * s, u as f32 * s, v as f32 * s, du as f32 * s, dv as f32 * s);
-
-    let quad: [[f32; 3]; 4] = match dir {
-        FaceDir::PosX => [[d+s+ox, u+oy,     v+dv+oz], [d+s+ox, u+oy,     v+oz    ], [d+s+ox, u+du+oy, v+oz    ], [d+s+ox, u+du+oy, v+dv+oz]],
-        FaceDir::NegX => [[d+ox,   u+oy,     v+oz    ], [d+ox,   u+oy,     v+dv+oz], [d+ox,   u+du+oy, v+dv+oz], [d+ox,   u+du+oy, v+oz    ]],
-        FaceDir::PosY => [[u+du+ox, d+s+oy,  v+oz    ], [u+ox,   d+s+oy,  v+oz    ], [u+ox,   d+s+oy,  v+dv+oz], [u+du+ox, d+s+oy,  v+dv+oz]],
-        FaceDir::NegY => [[u+du+ox, d+oy,    v+dv+oz], [u+ox,   d+oy,    v+dv+oz], [u+ox,   d+oy,    v+oz    ], [u+du+ox, d+oy,    v+oz    ]],
-        FaceDir::PosZ => [[u+ox,    v+oy,    d+s+oz  ], [u+du+ox, v+oy,  d+s+oz  ], [u+du+ox, v+dv+oy, d+s+oz], [u+ox,    v+dv+oy, d+s+oz  ]],
-        FaceDir::NegZ => [[u+du+ox, v+oy,    d+oz    ], [u+ox,   v+oy,    d+oz   ], [u+ox,   v+dv+oy, d+oz    ], [u+du+ox, v+dv+oy, d+oz    ]],
-    };
-
-    // du and dv are already in world units (pre-scaled), so tile directly.
-    let (s, t) = match dir {
-        FaceDir::PosX | FaceDir::NegX => (dv, du),
-        _                              => (du, dv),
-    };
-    let uvs   = quad_uvs(dir, s, t);
-    let layer = face_tex(block, dir) as f32;
-
-    let base   = vertices.len() as u32;
-    let normal = dir.normal();
-    for (pos, uv) in quad.iter().zip(uvs.iter()) {
-        vertices.push(Vertex { pos: *pos, normal, uv: [uv[0], uv[1] + layer * 256.0] });
-    }
-    indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
 }
 
 pub fn mesh_chunk(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec<u32>) {

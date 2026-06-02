@@ -15,7 +15,7 @@ impl Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { lod0: 20, lod1: 60, lod2: 120 }
+        Self { lod0: 20, lod1: 60, lod2: 0 }
     }
 }
 

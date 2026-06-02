@@ -228,7 +228,7 @@ fn record_command_buffer(
     let clear_values = [
         vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [0.05, 0.05, 0.07, 1.0],
+                float32: [0.4, 0.65, 1.0, 1.0],
             },
         },
         vk::ClearValue {

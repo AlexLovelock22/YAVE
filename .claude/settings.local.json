@@ -15,7 +15,9 @@
       "Bash(echo \"PID: $!\")",
       "PowerShell(Start-Process -FilePath \"C:\\\\Users\\\\kloak\\\\YAVE\\\\target\\\\release\\\\yave.exe\" -WorkingDirectory \"C:\\\\Users\\\\kloak\\\\YAVE\")",
       "PowerShell(Get-Process | Where-Object { $_.MainWindowTitle -ne \"\" } | Select-Object Name, Id, MainWindowTitle | Format-Table -AutoSize)",
-      "PowerShell(Stop-Process -Name \"yave\" -Force -ErrorAction SilentlyContinue)"
+      "PowerShell(Stop-Process -Name \"yave\" -Force -ErrorAction SilentlyContinue)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\kloak\\\\YAVE\" -Recurse -Include *.rs -ErrorAction SilentlyContinue)",
+      "Bash(Select-Object -ExpandProperty FullName)"
     ]
   }
 }

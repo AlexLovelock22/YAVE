@@ -1,28 +1,39 @@
 use crate::world::{
     chunk::CHUNK_SIZE,
-    continents::{continentalness_defs, ContinentDef, SEA_LEVEL},
+    continents::{continentalness_defs, ContinentDef, CONT_THRESHOLD, SEA_LEVEL},
     noise::simplex2d,
 };
 
-const HEIGHT_SCALE: f32 = 50.0;
+// ── Height ranges ─────────────────────────────────────────────────────────────
+//
+// The continent map blends two independent height ranges using the same noise:
+//   • Ocean floor: noise drives depth variation across the seabed
+//   • Land terrain: noise drives hills and mountains above sea level
+// The continental factor (0 = deep ocean, 1 = deep inland) blends between them,
+// so continental areas naturally rise out of the ocean floor.
 
-const INLAND_VAR_FREQ1: f32 = 1.0 / 1_500.0;
-const INLAND_VAR_AMP1:  f32 = 4.0;
-const INLAND_VAR_FREQ2: f32 = 1.0 /   500.0;
-const INLAND_VAR_AMP2:  f32 = 1.5;
+const OCEAN_FLOOR_MIN: f32 = 30.0;   // deepest open ocean
+const OCEAN_FLOOR_MAX: f32 = 105.0;  // shallow shelf / near coastline
 
-const HARDNESS_FREQ:  f32 = 1.0 / 700.0;
-const HARDNESS_PHASE: f32 = 271.3;
+const LAND_HEIGHT_MIN: f32 = 115.0;  // low coastal plains
+const LAND_HEIGHT_MAX: f32 = 235.0;  // mountain peaks
+
+// Continentalness c: negative = land (dome above threshold), positive = ocean.
+// Maximum expected magnitude on each side.
+const LAND_DEPTH:  f32 = 0.82;        // |c| at deepest inland point
+// CONT_THRESHOLD (0.18) is the max c value in open ocean
 
 // ── Grid interpolation ────────────────────────────────────────────────────────
 //
-// The continent noise is expensive (90 simplex calls per column).
-// We evaluate it on a 9×9 coarse grid and bilinearly interpolate to the full
-// 32×32 chunk — 81 samples instead of 1024, a 12× speedup with negligible error
-// because continentalness is smooth at 4-block scale.
+// Continent noise is expensive (90 simplex calls/column). Evaluate on a coarse
+// grid and bilinearly interpolate — 81 samples instead of 1024 per chunk.
 
 const GRID_STRIDE: usize = 4;
-const GRID_DIM:    usize = CHUNK_SIZE / GRID_STRIDE + 1; // = 9
+const GRID_DIM:    usize = CHUNK_SIZE / GRID_STRIDE + 1; // 9
+
+// Noise frequencies — two octaves for terrain variation.
+const NOISE_FREQ1: f32 = 1.0 / 1_500.0;
+const NOISE_FREQ2: f32 = 1.0 /   500.0;
 
 // ── Public API ────────────────────────────────────────────────────────────────
 
@@ -31,8 +42,8 @@ pub struct TerrainColumn {
     pub is_ocean:  bool,
 }
 
-/// Fills `out_surface` and `out_ocean` for all 1024 columns in a chunk.
-/// Returns the highest surface Y (used to cap the fill loop in world.rs).
+/// Fill `out_surface` and `out_ocean` for all 1024 columns in one chunk.
+/// Returns the highest non-ocean surface Y seen (caps mesh iteration).
 pub fn sample_chunk_heights(
     defs:        &[ContinentDef; 9],
     origin_x:    i32,
@@ -52,8 +63,8 @@ pub fn sample_chunk_heights(
             let gi = gx + gz * GRID_DIM;
 
             c_grid[gi]  = continentalness_defs(defs, fx, fz);
-            n1_grid[gi] = simplex2d(fx * INLAND_VAR_FREQ1, fz * INLAND_VAR_FREQ1);
-            n2_grid[gi] = simplex2d(fx * INLAND_VAR_FREQ2, fz * INLAND_VAR_FREQ2 + 17.3);
+            n1_grid[gi] = simplex2d(fx * NOISE_FREQ1, fz * NOISE_FREQ1);
+            n2_grid[gi] = simplex2d(fx * NOISE_FREQ2, fz * NOISE_FREQ2 + 17.3);
         }
     }
 
@@ -83,28 +94,52 @@ pub fn sample_chunk_heights(
     max_y
 }
 
-/// Single-column version kept for any code that needs ad-hoc sampling.
 pub fn sample_column(defs: &[ContinentDef; 9], wx: i32, wz: i32) -> TerrainColumn {
     let (fx, fz) = (wx as f32, wz as f32);
     let c  = continentalness_defs(defs, fx, fz);
-    let n1 = simplex2d(fx * INLAND_VAR_FREQ1, fz * INLAND_VAR_FREQ1);
-    let n2 = simplex2d(fx * INLAND_VAR_FREQ2, fz * INLAND_VAR_FREQ2 + 17.3);
+    let n1 = simplex2d(fx * NOISE_FREQ1, fz * NOISE_FREQ1);
+    let n2 = simplex2d(fx * NOISE_FREQ2, fz * NOISE_FREQ2 + 17.3);
     let (surface_y, is_ocean) = surface_from_cv(c, n1, n2);
     TerrainColumn { surface_y, is_ocean }
 }
 
-pub fn rock_hardness_raw(x: f32, z: f32) -> f32 {
-    let h1 = simplex2d(x * HARDNESS_FREQ + HARDNESS_PHASE, z * HARDNESS_FREQ);
-    let h2 = simplex2d(x * HARDNESS_FREQ * 2.5,            z * HARDNESS_FREQ * 2.5 + 43.7);
-    (h1 * 0.7 + h2 * 0.3) * 0.5 + 0.5
-}
-
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Blend ocean-floor and land-terrain height ranges using the continental factor.
+/// The same noise drives variation in both ranges, so the ocean floor and land
+/// share the same "shape" — continents are literally the seabed pushed upward.
 fn surface_from_cv(c: f32, n1: f32, n2: f32) -> (usize, bool) {
-    let noise = n1 * INLAND_VAR_AMP1 + n2 * INLAND_VAR_AMP2;
-    let sy = (SEA_LEVEL as f32 - c * HEIGHT_SCALE + noise).round().max(1.0) as usize;
+    // Map two noise octaves to [0, 1].
+    let noise_01 = (n1 * 0.7 + n2 * 0.3).clamp(-1.0, 1.0) * 0.5 + 0.5;
+
+    let ocean_h = lerp(OCEAN_FLOOR_MIN, OCEAN_FLOOR_MAX, noise_01);
+    let land_h  = lerp(LAND_HEIGHT_MIN, LAND_HEIGHT_MAX, noise_01);
+
+    let cf = cont_factor(c);
+    let sy = lerp(ocean_h, land_h, cf).round().max(1.0) as usize;
     (sy, sy < SEA_LEVEL)
+}
+
+/// Continental factor: 0.0 = deep ocean, 1.0 = deep inland.
+/// Splits on c=0 (the coast) and maps each side to [0, 0.5] or [0.5, 1].
+/// This keeps the midpoint (0.5) exactly at the coastline so the blended
+/// height hits SEA_LEVEL when noise_01 ≈ 0.5.
+fn cont_factor(c: f32) -> f32 {
+    if c >= 0.0 {
+        // Ocean side: c from 0 → CONT_THRESHOLD
+        let t = smoothstep(0.0, CONT_THRESHOLD, c);
+        0.5 * (1.0 - t)
+    } else {
+        // Land side: c from 0 → -LAND_DEPTH
+        let t = smoothstep(0.0, -LAND_DEPTH, c);
+        0.5 + 0.5 * t
+    }
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 #[inline]

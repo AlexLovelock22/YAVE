@@ -7,7 +7,7 @@ use ash::vk;
 use glam::{IVec2, IVec3, Vec3};
 
 use crate::{
-    meshing::greedy::{mesh_chunk, mesh_chunk_lod},
+    meshing::greedy::{mesh_chunk, mesh_chunk_surface},
     render::{
         buffer::create_buffer,
         context::VulkanContext,
@@ -147,28 +147,46 @@ impl World {
         self.deferred_frees[bucket].push(slot);
     }
 
+    /// Drain every deferred-free bucket back into both allocators.
+    /// Only call after confirming the GPU has finished (queue_wait_idle completed).
+    fn flush_all_deferred_frees(&mut self) {
+        let frees: Vec<ChunkSlot> = self.deferred_frees.iter_mut()
+            .flat_map(|b| b.drain(..))
+            .collect();
+        for slot in frees {
+            if let Some(ref mut a) = self.arena_vb { a.free(slot.vb_offset, slot.vb_size); }
+            if let Some(ref mut a) = self.arena_ib { a.free(slot.ib_offset, slot.ib_size); }
+        }
+    }
+
     /// Allocate `size` bytes from the vertex arena, growing if needed.
+    /// If the first-fit scan fails, stalls the GPU and reclaims all pending deferred frees
+    /// before resorting to a buffer grow — avoids spurious grows due to fragmentation.
     fn alloc_vb(&mut self, size: usize, ctx: &VulkanContext, pool: vk::CommandPool) -> Option<usize> {
-        if let Some(ref mut a) = self.arena_vb {
-            if let Some(off) = a.alloc(size) { return Some(off); }
-            let new_cap = (a.cap + size).next_power_of_two();
-            if let Err(e) = a.ensure_cap(ctx, pool, new_cap) {
-                eprintln!("[arena_vb] grow: {e}"); return None;
-            }
-            a.alloc(size)
-        } else { None }
+        if let Some(off) = self.arena_vb.as_mut()?.alloc(size) { return Some(off); }
+        unsafe { let _ = ctx.device.queue_wait_idle(ctx.graphics_queue); }
+        self.flush_all_deferred_frees();
+        let a = self.arena_vb.as_mut()?;
+        if let Some(off) = a.alloc(size) { return Some(off); }
+        let new_cap = (a.cap + size).next_power_of_two();
+        if let Err(e) = a.ensure_cap(ctx, pool, new_cap) {
+            eprintln!("[arena_vb] grow: {e}"); return None;
+        }
+        a.alloc(size)
     }
 
     /// Allocate `size` bytes from the index arena, growing if needed.
     fn alloc_ib(&mut self, size: usize, ctx: &VulkanContext, pool: vk::CommandPool) -> Option<usize> {
-        if let Some(ref mut a) = self.arena_ib {
-            if let Some(off) = a.alloc(size) { return Some(off); }
-            let new_cap = (a.cap + size).next_power_of_two();
-            if let Err(e) = a.ensure_cap(ctx, pool, new_cap) {
-                eprintln!("[arena_ib] grow: {e}"); return None;
-            }
-            a.alloc(size)
-        } else { None }
+        if let Some(off) = self.arena_ib.as_mut()?.alloc(size) { return Some(off); }
+        unsafe { let _ = ctx.device.queue_wait_idle(ctx.graphics_queue); }
+        self.flush_all_deferred_frees();
+        let a = self.arena_ib.as_mut()?;
+        if let Some(off) = a.alloc(size) { return Some(off); }
+        let new_cap = (a.cap + size).next_power_of_two();
+        if let Err(e) = a.ensure_cap(ctx, pool, new_cap) {
+            eprintln!("[arena_ib] grow: {e}"); return None;
+        }
+        a.alloc(size)
     }
 
     fn spawn_mesh(&mut self, coord: IVec2) {
@@ -184,8 +202,8 @@ impl World {
             let (lod0, (lod1, lod2)) = rayon::join(
                 || mesh_chunk(&chunk, &neighbors),
                 || rayon::join(
-                    || mesh_chunk_lod(&chunk, &neighbors, 2),
-                    || mesh_chunk_lod(&chunk, &neighbors, 4),
+                    || mesh_chunk_surface(&chunk, &neighbors),
+                    || (Vec::new(), Vec::new()), // LOD2 unused; cull_draws falls back to LOD1
                 ),
             );
             let mesh_us = t1.elapsed().as_micros() as u64;
@@ -196,12 +214,12 @@ impl World {
     pub fn update(&mut self, camera_pos: Vec3, ctx: &VulkanContext) {
         // ── Lazy GPU resource init ────────────────────────────────────────────
         if self.arena_vb.is_none() {
-            // Scale with render distance so large worlds don't hit frequent arena-grow stalls
-            // (each grow calls queue_wait_idle which is a full GPU stall).
-            // Estimate: ~2500 bytes/chunk for VB (mix of LOD0/LOD2), ~400 bytes/chunk for IB.
+            // Scale with render distance so large worlds don't hit frequent arena-grow stalls.
+            // LOD0 and LOD1 are both full-resolution (surface mesher), so budget ~5000 bytes/chunk
+            // for VB and ~800 bytes/chunk for IB across both LODs combined.
             let chunks = ((2 * self.render_distance + 1) as usize).pow(2);
-            let vb_cap = (chunks * 2_500).next_power_of_two().clamp(128 << 20, 512 << 20);
-            let ib_cap = (chunks *   400).next_power_of_two().clamp( 32 << 20, 128 << 20);
+            let vb_cap = (chunks * 5_000).next_power_of_two().clamp(256 << 20, 512 << 20);
+            let ib_cap = (chunks *   800).next_power_of_two().clamp( 64 << 20, 128 << 20);
             match (
                 ArenaBuffer::new(ctx, vb_cap, vk::BufferUsageFlags::VERTEX_BUFFER, size_of::<Vertex>()),
                 ArenaBuffer::new(ctx, ib_cap, vk::BufferUsageFlags::INDEX_BUFFER,  size_of::<u32>()),
@@ -719,12 +737,14 @@ fn generate(origin: IVec3) -> Chunk {
         for x in 0..CHUNK_SIZE {
             let idx = x + z * CHUNK_SIZE;
             let sy  = surface[idx] as usize;
+
+            // Fill solid stone from y=0 up to (but not including) the surface.
+            for y in 0..sy { chunk.set(x, y, z, STONE); }
+
             if is_ocean[idx] {
                 chunk.set(x, sy, z, STONE);
                 for y in (sy + 1)..=SEA_LEVEL { chunk.set(x, y, z, WATER); }
             } else {
-                const STONE_DEPTH: usize = 16;
-                for y in sy.saturating_sub(STONE_DEPTH)..sy { chunk.set(x, y, z, STONE); }
                 chunk.set(x, sy, z, DIRT);
             }
         }
