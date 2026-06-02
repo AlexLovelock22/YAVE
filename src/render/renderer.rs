@@ -7,6 +7,7 @@ use super::{
     mesh::PushConstants,
     pipeline::{self, Pipeline},
     swapchain::{self, Swapchain},
+    texture::TextureArray,
 };
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -15,6 +16,7 @@ pub struct Renderer {
     pub ctx: VulkanContext,
     pub swapchain: Swapchain,
     pub pipeline: Pipeline,
+    texture: TextureArray,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
     // Per-frame: one image_available semaphore + one fence
@@ -46,7 +48,8 @@ impl Renderer {
         };
         let color_format = super::swapchain::choose_surface_format(&formats);
 
-        let pipeline = Pipeline::new(&ctx, color_format)?;
+        let texture  = TextureArray::new(&ctx, command_pool)?;
+        let pipeline = Pipeline::new(&ctx, color_format, texture.desc_layout)?;
         let swapchain =
             Swapchain::new(&ctx, pipeline.render_pass, size.width, size.height)?;
 
@@ -77,6 +80,7 @@ impl Renderer {
             ctx,
             swapchain,
             pipeline,
+            texture,
             command_pool,
             command_buffers,
             image_available,
@@ -89,9 +93,8 @@ impl Renderer {
     pub fn draw_frame(
         &mut self,
         render_bufs: Option<(vk::Buffer, vk::Buffer)>,
-        draws: &[(u32, u32)],
+        indirect: Option<(vk::Buffer, u32)>,
         push: PushConstants,
-        mesh_barrier: bool,
     ) -> Result<()> {
         let fences = [self.in_flight[self.current_frame]];
         unsafe { self.ctx.device.wait_for_fences(&fences, true, u64::MAX)? };
@@ -126,10 +129,10 @@ impl Renderer {
             &self.swapchain,
             &self.pipeline,
             render_bufs,
-            draws,
+            indirect,
             push,
+            self.texture.desc_set,
             image_index as usize,
-            mesh_barrier,
         )?;
 
         let wait_semaphores = [self.image_available[self.current_frame]];
@@ -202,6 +205,7 @@ impl Drop for Renderer {
             }
             swapchain::destroy(&self.ctx, &self.swapchain);
             pipeline::destroy(&self.ctx, &self.pipeline);
+            self.texture.destroy(&self.ctx);
             self.ctx.device.destroy_command_pool(self.command_pool, None);
         }
     }
@@ -213,10 +217,10 @@ fn record_command_buffer(
     sc: &Swapchain,
     pipeline: &Pipeline,
     render_bufs: Option<(vk::Buffer, vk::Buffer)>,
-    draws: &[(u32, u32)],
+    indirect: Option<(vk::Buffer, u32)>,
     push: PushConstants,
+    desc_set: vk::DescriptorSet,
     image_index: usize,
-    mesh_barrier: bool,
 ) -> Result<()> {
     let begin = vk::CommandBufferBeginInfo { ..Default::default() };
     unsafe { ctx.device.begin_command_buffer(cmd, &begin)? };
@@ -251,6 +255,10 @@ fn record_command_buffer(
             .cmd_begin_render_pass(cmd, &rp_begin, vk::SubpassContents::INLINE);
         ctx.device
             .cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.pipeline);
+        ctx.device.cmd_bind_descriptor_sets(
+            cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.layout,
+            0, &[desc_set], &[],
+        );
 
         let viewport = vk::Viewport {
             x: 0.0,
@@ -276,32 +284,35 @@ fn record_command_buffer(
             bytes_of(&push),
         );
 
-        if let Some((vb, ib)) = render_bufs {
-            // On the first frame after a buffer swap the copy may not yet be visible to
-            // the vertex shader.  Emit the memory barrier that was deliberately omitted
-            // from the copy command so that intermediate renders on the same queue are not
-            // stalled.  By the time this fires the copy fence has already signalled, so the
-            // barrier resolves without any real GPU wait.
-            if mesh_barrier {
+        if let (Some((vb, ib)), Some((ind_buf, draw_count))) = (render_bufs, indirect) {
+            if draw_count > 0 {
+                // Ensure all preceding staging→arena DMA copies are visible to the
+                // vertex/index fetch stage and that the CPU write to the indirect buffer
+                // is visible to the DRAW_INDIRECT stage.
                 ctx.device.cmd_pipeline_barrier(
                     cmd,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::VERTEX_INPUT,
+                    vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::HOST,
+                    vk::PipelineStageFlags::VERTEX_INPUT | vk::PipelineStageFlags::DRAW_INDIRECT,
                     vk::DependencyFlags::empty(),
                     &[vk::MemoryBarrier {
-                        src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                        src_access_mask: vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::HOST_WRITE,
                         dst_access_mask: vk::AccessFlags::VERTEX_ATTRIBUTE_READ
-                            | vk::AccessFlags::INDEX_READ,
+                            | vk::AccessFlags::INDEX_READ
+                            | vk::AccessFlags::INDIRECT_COMMAND_READ,
                         ..Default::default()
                     }],
                     &[],
                     &[],
                 );
-            }
-            ctx.device.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
-            ctx.device.cmd_bind_index_buffer(cmd, ib, 0, vk::IndexType::UINT32);
-            for &(first_index, index_count) in draws {
-                ctx.device.cmd_draw_indexed(cmd, index_count, 1, first_index, 0, 0);
+                ctx.device.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
+                ctx.device.cmd_bind_index_buffer(cmd, ib, 0, vk::IndexType::UINT32);
+                ctx.device.cmd_draw_indexed_indirect(
+                    cmd,
+                    ind_buf,
+                    0,
+                    draw_count,
+                    std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+                );
             }
         }
         ctx.device.cmd_end_render_pass(cmd);

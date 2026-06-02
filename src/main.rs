@@ -3,6 +3,7 @@ mod camera;
 mod meshing;
 mod models;
 mod render;
+mod settings;
 mod world;
 
 use std::sync::Arc;

@@ -4,3 +4,4 @@ pub mod mesh;
 pub mod pipeline;
 pub mod renderer;
 pub mod swapchain;
+pub mod texture;

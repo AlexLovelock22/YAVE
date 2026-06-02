@@ -12,9 +12,9 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new(ctx: &VulkanContext, color_format: vk::Format) -> Result<Self> {
+    pub fn new(ctx: &VulkanContext, color_format: vk::Format, desc_layout: vk::DescriptorSetLayout) -> Result<Self> {
         let render_pass = create_render_pass(&ctx.device, color_format)?;
-        let (layout, pipeline) = create_pipeline(&ctx.device, render_pass)?;
+        let (layout, pipeline) = create_pipeline(&ctx.device, render_pass, desc_layout)?;
         Ok(Self { render_pass, layout, pipeline })
     }
 }
@@ -102,6 +102,7 @@ fn create_render_pass(
 fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
+    desc_layout: vk::DescriptorSetLayout,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     let vert_spv = include_bytes!(concat!(env!("OUT_DIR"), "/voxel.vert.spv"));
     let frag_spv = include_bytes!(concat!(env!("OUT_DIR"), "/voxel.frag.spv"));
@@ -191,10 +192,13 @@ fn create_pipeline(
         offset: 0,
         size: 64,
     };
-    let push_ranges = [push_range];
+    let push_ranges   = [push_range];
+    let set_layouts   = [desc_layout];
     let layout_info = vk::PipelineLayoutCreateInfo {
+        set_layout_count:          set_layouts.len() as u32,
+        p_set_layouts:             set_layouts.as_ptr(),
         push_constant_range_count: push_ranges.len() as u32,
-        p_push_constant_ranges: push_ranges.as_ptr(),
+        p_push_constant_ranges:    push_ranges.as_ptr(),
         ..Default::default()
     };
     let layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };

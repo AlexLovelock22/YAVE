@@ -1,0 +1,11 @@
+# YAVE render distance settings
+#
+# lod0: full-resolution band width  (chunks 0 .. lod0)
+# lod1: half-resolution band width  (chunks lod0 .. lod0+lod1,  scale=2)
+# lod2: quarter-resolution band width (chunks lod0+lod1 .. lod0+lod1+lod2, scale=4)
+#
+# render_distance = lod0 + lod1 + lod2
+
+lod0 = 60
+lod1 = 20
+lod2 = 30

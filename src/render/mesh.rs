@@ -3,14 +3,14 @@ use ash::vk;
 use bytemuck::{Pod, Zeroable};
 
 use crate::models::{block_model::BlockModel, face::FaceDir};
-use super::{buffer::{create_staging_and_dst, upload_device_local, upload_via_staging}, context::VulkanContext};
+use super::{buffer::{create_buffer, create_staging_and_dst, upload_device_local, upload_via_staging}, context::VulkanContext};
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
     pub pos: [f32; 3],
     pub normal: [f32; 3],
-    pub uv: [f32; 2],
+    pub uv: [f32; 2],  // [u_tile,  v_tile + layer_index * 256.0]
 }
 
 #[repr(C)]
@@ -105,7 +105,7 @@ impl GpuMesh {
                 let base = vertices.len() as u32;
                 let normal = dir.normal();
                 for i in 0..4 {
-                    vertices.push(Vertex { pos: face.verts[i], normal, uv: face.uvs[i] });
+                    vertices.push(Vertex { pos: face.verts[i], normal, uv: [face.uvs[i][0], face.uvs[i][1] + face.texture as f32 * 256.0] });
                 }
                 indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
             }
@@ -316,5 +316,281 @@ impl GpuMesh {
             ctx.device.destroy_buffer(self.index_buffer, None);
             ctx.device.free_memory(self.index_memory, None);
         }
+    }
+}
+
+// ── GPU arena types ───────────────────────────────────────────────────────────
+
+const VB_ALIGN: usize = std::mem::size_of::<Vertex>(); // 32 — vertex_base must be integer
+const IB_ALIGN: usize = std::mem::size_of::<u32>();    // 4
+
+/// Location of one LOD mesh inside the arena.
+#[derive(Clone, Copy)]
+pub struct ChunkSlot {
+    pub vb_offset:   usize,
+    pub vb_size:     usize,
+    pub ib_offset:   usize,
+    pub ib_size:     usize,
+    pub index_count: u32,
+    /// firstIndex for DrawIndexedIndirectCommand (= ib_offset / 4).
+    pub first_index: u32,
+    /// vertexOffset for DrawIndexedIndirectCommand (= vb_offset / VB_ALIGN as i32).
+    pub vertex_base: i32,
+}
+
+/// Large DEVICE_LOCAL buffer with a first-fit free-list sub-allocator.
+/// Both vertex and index arenas are this type; alignment differs.
+pub struct ArenaBuffer {
+    pub buffer: vk::Buffer,
+    memory:     vk::DeviceMemory,
+    pub cap:    usize,
+    free_list:  Vec<(usize, usize)>, // (byte_offset, byte_len) sorted, coalesced
+    usage:      vk::BufferUsageFlags,
+    align:      usize,
+}
+
+impl ArenaBuffer {
+    pub fn new(ctx: &VulkanContext, cap: usize, usage: vk::BufferUsageFlags, align: usize) -> Result<Self> {
+        let (buffer, memory) = create_buffer(
+            ctx, cap as vk::DeviceSize,
+            usage | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        Ok(Self { buffer, memory, cap, free_list: vec![(0, cap)], usage, align })
+    }
+
+    pub fn alloc(&mut self, size: usize) -> Option<usize> {
+        if size == 0 { return Some(0); }
+        let size = ((size + self.align - 1) / self.align) * self.align;
+        for i in 0..self.free_list.len() {
+            let (off, len) = self.free_list[i];
+            if len >= size {
+                if len > size {
+                    self.free_list[i] = (off + size, len - size);
+                } else {
+                    self.free_list.remove(i);
+                }
+                return Some(off);
+            }
+        }
+        None
+    }
+
+    pub fn free(&mut self, offset: usize, size: usize) {
+        if size == 0 { return; }
+        let size = ((size + self.align - 1) / self.align) * self.align;
+        let pos = self.free_list.partition_point(|&(o, _)| o < offset);
+        self.free_list.insert(pos, (offset, size));
+        // Coalesce with next
+        if pos + 1 < self.free_list.len() {
+            let (o, s) = self.free_list[pos];
+            if o + s == self.free_list[pos + 1].0 {
+                let ns = self.free_list.remove(pos + 1).1;
+                self.free_list[pos].1 = s + ns;
+            }
+        }
+        // Coalesce with prev
+        if pos > 0 {
+            let (po, ps) = self.free_list[pos - 1];
+            if po + ps == self.free_list[pos].0 {
+                let cs = self.free_list.remove(pos).1;
+                self.free_list[pos - 1].1 = ps + cs;
+            }
+        }
+    }
+
+    /// Grow to fit `needed` extra bytes. GPU-copies old content; blocks until complete.
+    pub fn ensure_cap(&mut self, ctx: &VulkanContext, pool: vk::CommandPool, needed: usize) -> Result<()> {
+        if needed <= self.cap { return Ok(()); }
+        let new_cap = needed.next_power_of_two().max(self.cap * 2);
+        let (new_buf, new_mem) = create_buffer(
+            ctx, new_cap as vk::DeviceSize,
+            self.usage | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        unsafe {
+            let cmd_info = vk::CommandBufferAllocateInfo {
+                command_pool: pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            let cmd = ctx.device.allocate_command_buffers(&cmd_info)?[0];
+            ctx.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            })?;
+            ctx.device.cmd_copy_buffer(cmd, self.buffer, new_buf, &[vk::BufferCopy {
+                src_offset: 0, dst_offset: 0, size: self.cap as vk::DeviceSize,
+            }]);
+            ctx.device.end_command_buffer(cmd)?;
+            let cmds = [cmd];
+            ctx.device.queue_submit(ctx.graphics_queue, &[vk::SubmitInfo {
+                command_buffer_count: 1,
+                p_command_buffers: cmds.as_ptr(),
+                ..Default::default()
+            }], vk::Fence::null())?;
+            ctx.device.queue_wait_idle(ctx.graphics_queue)?;
+            ctx.device.free_command_buffers(pool, &cmds);
+            ctx.device.destroy_buffer(self.buffer, None);
+            ctx.device.free_memory(self.memory, None);
+        }
+        self.free(self.cap, new_cap - self.cap);
+        self.buffer = new_buf;
+        self.memory = new_mem;
+        self.cap    = new_cap;
+        Ok(())
+    }
+
+    pub fn destroy(&self, ctx: &VulkanContext) {
+        unsafe {
+            ctx.device.destroy_buffer(self.buffer, None);
+            ctx.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// Persistently-mapped HOST_COHERENT buffer for indirect draw commands.
+/// Written by the CPU each frame after frustum culling; read by the GPU.
+pub struct IndirectBuffer {
+    pub buffer: vk::Buffer,
+    memory:     vk::DeviceMemory,
+    ptr:        *mut vk::DrawIndexedIndirectCommand,
+    pub cap:    usize, // command capacity
+}
+
+unsafe impl Send for IndirectBuffer {}
+
+impl IndirectBuffer {
+    pub fn new(ctx: &VulkanContext, cap: usize) -> Result<Self> {
+        let byte_size = (cap * std::mem::size_of::<vk::DrawIndexedIndirectCommand>()) as vk::DeviceSize;
+        let (buffer, memory) = create_buffer(
+            ctx, byte_size,
+            vk::BufferUsageFlags::INDIRECT_BUFFER,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        let ptr = unsafe {
+            ctx.device.map_memory(memory, 0, byte_size, vk::MemoryMapFlags::empty())?
+                as *mut vk::DrawIndexedIndirectCommand
+        };
+        Ok(Self { buffer, memory, ptr, cap })
+    }
+
+    /// Write `cmds` into the mapped buffer. Must be called before submitting the draw.
+    pub fn write(&self, cmds: &[vk::DrawIndexedIndirectCommand]) {
+        debug_assert!(cmds.len() <= self.cap);
+        unsafe { std::ptr::copy_nonoverlapping(cmds.as_ptr(), self.ptr, cmds.len()); }
+    }
+
+    pub fn ensure_cap(&mut self, ctx: &VulkanContext, needed: usize) -> Result<()> {
+        if needed <= self.cap { return Ok(()); }
+        self.destroy(ctx);
+        *self = Self::new(ctx, needed.next_power_of_two())?;
+        Ok(())
+    }
+
+    pub fn destroy(&self, ctx: &VulkanContext) {
+        unsafe {
+            ctx.device.unmap_memory(self.memory);
+            ctx.device.destroy_buffer(self.buffer, None);
+            ctx.device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// In-flight async upload of one chunk LOD mesh into the arena (staging → DEVICE_LOCAL).
+pub struct ChunkUpload {
+    pub fence:  vk::Fence,
+    cmd:        vk::CommandBuffer,
+    staging_vb: vk::Buffer,
+    staging_vm: vk::DeviceMemory,
+    staging_ib: vk::Buffer,
+    staging_im: vk::DeviceMemory,
+    pub slot:   ChunkSlot,
+}
+
+impl ChunkUpload {
+    /// Allocate staging memory, fill it, and submit a copy into the arena at `slot`.
+    pub fn begin(
+        vertices: &[Vertex],
+        indices:  &[u32],
+        slot:     ChunkSlot,
+        arena_vb: vk::Buffer,
+        arena_ib: vk::Buffer,
+        ctx:      &VulkanContext,
+        pool:     vk::CommandPool,
+    ) -> Result<Self> {
+        let vb_bytes = slot.vb_size as vk::DeviceSize;
+        let ib_bytes = slot.ib_size as vk::DeviceSize;
+
+        let (staging_vb, staging_vm) = create_buffer(ctx, vb_bytes,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
+        let (staging_ib, staging_im) = create_buffer(ctx, ib_bytes,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?;
+
+        unsafe {
+            let p = ctx.device.map_memory(staging_vm, 0, vb_bytes, vk::MemoryMapFlags::empty())? as *mut u8;
+            std::ptr::copy_nonoverlapping(vertices.as_ptr() as *const u8, p, vb_bytes as usize);
+            ctx.device.unmap_memory(staging_vm);
+
+            let p = ctx.device.map_memory(staging_im, 0, ib_bytes, vk::MemoryMapFlags::empty())? as *mut u8;
+            std::ptr::copy_nonoverlapping(indices.as_ptr() as *const u8, p, ib_bytes as usize);
+            ctx.device.unmap_memory(staging_im);
+        }
+
+        let cmd = unsafe {
+            ctx.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo {
+                command_pool: pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            })?[0]
+        };
+        unsafe {
+            ctx.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            })?;
+            ctx.device.cmd_copy_buffer(cmd, staging_vb, arena_vb,
+                &[vk::BufferCopy { src_offset: 0, dst_offset: slot.vb_offset as vk::DeviceSize, size: vb_bytes }]);
+            ctx.device.cmd_copy_buffer(cmd, staging_ib, arena_ib,
+                &[vk::BufferCopy { src_offset: 0, dst_offset: slot.ib_offset as vk::DeviceSize, size: ib_bytes }]);
+            ctx.device.end_command_buffer(cmd)?;
+        }
+
+        let fence = unsafe { ctx.device.create_fence(&vk::FenceCreateInfo::default(), None)? };
+        let cmds = [cmd];
+        unsafe {
+            ctx.device.queue_submit(ctx.graphics_queue, &[vk::SubmitInfo {
+                command_buffer_count: 1,
+                p_command_buffers: cmds.as_ptr(),
+                ..Default::default()
+            }], fence)?;
+        }
+
+        Ok(Self { fence, cmd, staging_vb, staging_vm, staging_ib, staging_im, slot })
+    }
+
+    pub fn is_ready(&self, ctx: &VulkanContext) -> bool {
+        unsafe { ctx.device.get_fence_status(self.fence).unwrap_or(false) }
+    }
+
+    pub fn finish(self, ctx: &VulkanContext, pool: vk::CommandPool) -> ChunkSlot {
+        unsafe {
+            ctx.device.destroy_fence(self.fence, None);
+            ctx.device.free_command_buffers(pool, &[self.cmd]);
+            ctx.device.destroy_buffer(self.staging_vb, None);
+            ctx.device.free_memory(self.staging_vm, None);
+            ctx.device.destroy_buffer(self.staging_ib, None);
+            ctx.device.free_memory(self.staging_im, None);
+        }
+        self.slot
+    }
+
+    pub fn abort(self, ctx: &VulkanContext, pool: vk::CommandPool) {
+        unsafe { let _ = ctx.device.wait_for_fences(&[self.fence], true, u64::MAX); }
+        self.finish(ctx, pool);
     }
 }

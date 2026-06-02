@@ -9,9 +9,12 @@ use winit::{
     window::{CursorGrabMode, Window},
 };
 
+use ash::vk;
+
 use crate::{
     camera::Camera,
     render::{mesh::PushConstants, renderer::Renderer},
+    settings,
     world::world::World,
 };
 
@@ -27,7 +30,7 @@ pub struct App {
     /// Per-frame durations (µs) accumulated for the current 1-second window.
     frame_times_us: Vec<u32>,
     fps_window_timer: Instant,
-    draw_buf: Vec<(u32, u32)>,
+    draw_buf: Vec<vk::DrawIndexedIndirectCommand>,
     title_timer: Instant,
 }
 
@@ -38,9 +41,9 @@ impl App {
         let aspect = size.width as f32 / size.height as f32;
         let camera = Camera::new(aspect);
 
-        let RD = 80;
-        let mut world = World::new(RD);
-        world.update(camera.position, &renderer.ctx, renderer.command_pool());
+        let s = settings::load();
+        let mut world = World::new(s.render_distance(), s.lod1_dist(), s.lod2_dist());
+        world.update(camera.position, &renderer.ctx);
 
         Ok(Self {
             window,
@@ -159,36 +162,35 @@ impl App {
         self.camera.apply_movement(&self.keys_held, dt);
 
         let t_update = Instant::now();
-        self.world.update(self.camera.position, &self.renderer.ctx, self.renderer.command_pool());
+        self.world.update(self.camera.position, &self.renderer.ctx);
         let update_us = t_update.elapsed().as_micros() as u64;
 
         let t_cull = Instant::now();
         let planes = self.camera.frustum_planes();
         self.world.cull_draws(&planes, self.camera.position, &mut self.draw_buf);
+        self.world.flush_indirect(&self.draw_buf, &self.renderer.ctx);
         let cull_us = t_cull.elapsed().as_micros() as u64;
 
         if self.title_timer.elapsed().as_millis() >= 100 {
             self.title_timer = Instant::now();
             // index_count * 2/3 = vertex count (every quad is 4 verts / 6 indices).
-            let verts: u32 = self.draw_buf.iter().map(|&(_, ic)| ic * 2 / 3).sum();
+            let verts: u32 = self.draw_buf.iter().map(|c| c.index_count * 2 / 3).sum();
             self.window.set_title(&format!("YAVE  |  {} verts  |  {} chunks", verts, self.draw_buf.len()));
         }
 
         let push = PushConstants { mvp: self.camera.view_proj().to_cols_array_2d() };
         let t_gpu = Instant::now();
-        let barrier = self.world.needs_mesh_barrier;
-        let r = self.renderer.draw_frame(self.world.render_buffers(), &self.draw_buf, push, barrier);
-        self.world.needs_mesh_barrier = false;
+        let r = self.renderer.draw_frame(self.world.render_buffers(), self.world.indirect_draw(), push);
         let gpu_us = t_gpu.elapsed().as_micros() as u64;
 
         // Only print breakdown on frames that are "slow" (>2ms total) to avoid noise.
         let total_us = update_us + cull_us + gpu_us;
-        if total_us > 2_000 {
-            println!(
-                "  └ update={}µs  cull={}µs  draw={}µs  draws={}",
-                update_us, cull_us, gpu_us, self.draw_buf.len()
-            );
-        }
+        // if total_us > 2_000 {
+        //     println!(
+        //         "  └ update={}µs  cull={}µs  draw={}µs  draws={}",
+        //         update_us, cull_us, gpu_us, self.draw_buf.len()
+        //     );
+        // }
 
         r
     }
