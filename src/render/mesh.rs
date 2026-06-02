@@ -185,32 +185,10 @@ impl GpuMesh {
                 &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: vb_bytes }]);
             ctx.device.cmd_copy_buffer(cmd, staging_ib, dst_ib,
                 &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: ib_bytes }]);
-            ctx.device.cmd_pipeline_barrier(
-                cmd,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::VERTEX_INPUT,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[
-                    vk::BufferMemoryBarrier {
-                        src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                        dst_access_mask: vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
-                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        buffer: dst_vb, offset: 0, size: vk::WHOLE_SIZE,
-                        ..Default::default()
-                    },
-                    vk::BufferMemoryBarrier {
-                        src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
-                        dst_access_mask: vk::AccessFlags::INDEX_READ,
-                        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        buffer: dst_ib, offset: 0, size: vk::WHOLE_SIZE,
-                        ..Default::default()
-                    },
-                ],
-                &[],
-            );
+            // No pipeline barrier here: adding VERTEX_INPUT as a dst stage would serialise
+            // every subsequent render on this queue with the copy, even renders that still use
+            // the old buffer.  The barrier is instead emitted in the first render command that
+            // actually binds the new buffer (see World::needs_mesh_barrier / Renderer).
             ctx.device.end_command_buffer(cmd)?;
 
             let fence = ctx.device.create_fence(&vk::FenceCreateInfo::default(), None)?;

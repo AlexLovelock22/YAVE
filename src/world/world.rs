@@ -7,7 +7,7 @@ use ash::vk;
 use glam::{IVec2, IVec3, Vec3};
 
 use crate::{
-    meshing::greedy::mesh_chunk,
+    meshing::greedy::{mesh_chunk, mesh_chunk_lod},
     render::{
         buffer::create_buffer,
         context::VulkanContext,
@@ -23,19 +23,26 @@ use crate::{
 };
 
 const DESTROY_LAG: usize = 3;
-const REBUILD_COOLDOWN_MS: u128 = 300;
+const REBUILD_COOLDOWN_MS: u128 = 1500;
+/// Set to false to force LOD 0 everywhere (relaunch required).
+const ENABLE_LOD: bool = true;
+/// Chebyshev chunk-distance thresholds for LOD 0→1 and 1→2 transitions.
+const LOD1_DIST: i32 = 60;
+const LOD2_DIST: i32 = 72;
 
-type GenResult  = (IVec2, ChunkFaceData);
-type MeshResult = (IVec2, Vec<Vertex>, Vec<u32>, u64, u64);
+type GenResult  = (IVec2, ChunkFaceData, Chunk);
+/// Per-chunk result: LOD 0/1/2 meshes + timing.
+type MeshResult = (IVec2, [(Vec<Vertex>, Vec<u32>); 3], u64, u64);
 /// Rayon writes directly into the persistent staging buffers and sends back the byte counts.
 type RebuildResult = (usize, usize, u64); // (vb_bytes, ib_bytes, assemble_us)
 
+/// Per-chunk draw params: (first_index, index_count) for each of the 3 LOD levels.
+type LodDraws = [(u32, u32); 3];
+
 /// Per-chunk draw params to commit when a pending upload completes.
 enum DrawUpdate {
-    /// Replace chunk_draws entirely (full rebuild changed the layout).
-    Full(Vec<(IVec2, u32, u32)>),
-    /// Append new entries (incremental builds only add to the end).
-    Incremental(Vec<(IVec2, u32, u32)>),
+    Full(Vec<(IVec2, LodDraws)>),
+    Incremental(Vec<(IVec2, LodDraws)>),
 }
 
 /// Persistently mapped HOST_VISIBLE staging buffer reused across rebuilds.
@@ -122,8 +129,10 @@ pub struct World {
     mesh_in_flight:  HashSet<IVec2>,
     last_cam_chunk:  IVec2,
     face_data:       HashMap<IVec2, ChunkFaceData>,
-    /// Arc so the background assembly task can hold refs without copying.
-    cpu_meshes:      HashMap<IVec2, Arc<(Vec<Vertex>, Vec<u32>)>>,
+    /// Chunks that finished Stage 1 but are waiting for neighbors before Stage 2 meshing.
+    pending_chunks:  HashMap<IVec2, Chunk>,
+    /// LOD 0/1/2 meshes per chunk. Arc so rayon can hold refs without copying.
+    cpu_meshes:      HashMap<IVec2, [Arc<(Vec<Vertex>, Vec<u32>)>; 3]>,
     combined:        Option<GpuMesh>,
     world_dirty:     bool,
     last_rebuild:    Instant,
@@ -167,9 +176,14 @@ pub struct World {
     staging_ib_used: usize,
     /// Per-chunk draw parameters for the CURRENT committed GPU layout.
     /// Stored as a Vec for sequential (cache-friendly) iteration in cull_draws.
-    chunk_draws: Vec<(IVec2, u32, u32)>,
+    /// Each entry: (coord, [(first_index, index_count); LOD0, LOD1, LOD2]).
+    chunk_draws: Vec<(IVec2, LodDraws)>,
     /// Draw params for the in-flight upload; committed to chunk_draws when the fence fires.
     pending_draws: Option<DrawUpdate>,
+    /// Set when the combined buffer is swapped to a freshly-copied region. The renderer
+    /// must emit a TRANSFER_WRITE → VERTEX_INPUT memory barrier before the first draw that
+    /// uses the new buffer, then clear this flag.
+    pub needs_mesh_barrier: bool,
 }
 
 impl World {
@@ -185,6 +199,7 @@ impl World {
             mesh_in_flight: HashSet::new(),
             last_cam_chunk: IVec2::new(i32::MAX, i32::MAX),
             face_data:      HashMap::new(),
+            pending_chunks: HashMap::new(),
             cpu_meshes:     HashMap::new(),
             combined:       None,
             world_dirty:    false,
@@ -214,6 +229,7 @@ impl World {
             staging_ib_used:      0,
             chunk_draws:          Vec::new(),
             pending_draws:        None,
+            needs_mesh_barrier:   false,
         }
     }
 
@@ -224,17 +240,28 @@ impl World {
 
     fn spawn_mesh(&mut self, coord: IVec2) {
         let neighbors = build_neighbor_masks(coord, &self.face_data);
-        let tx     = self.mesh_tx.clone();
-        let origin = IVec3::new(coord.x * CHUNK_SIZE as i32, 0, coord.y * CHUNK_SIZE as i32);
+        let tx    = self.mesh_tx.clone();
+        let chunk = self.pending_chunks.remove(&coord).unwrap_or_else(|| {
+            let origin = IVec3::new(coord.x * CHUNK_SIZE as i32, 0, coord.y * CHUNK_SIZE as i32);
+            generate(origin)
+        });
         self.mesh_in_flight.insert(coord);
         rayon::spawn(move || {
-            let t0 = Instant::now();
-            let chunk = generate(origin);
-            let gen_us = t0.elapsed().as_micros() as u64;
             let t1 = Instant::now();
-            let (verts, idxs) = mesh_chunk(&chunk, &neighbors);
+            let lods = if ENABLE_LOD {
+                let (lod0, (lod1, lod2)) = rayon::join(
+                    || mesh_chunk(&chunk, &neighbors),
+                    || rayon::join(
+                        || mesh_chunk_lod(&chunk, 2),
+                        || mesh_chunk_lod(&chunk, 4),
+                    ),
+                );
+                [lod0, lod1, lod2]
+            } else {
+                [mesh_chunk(&chunk, &neighbors), (vec![], vec![]), (vec![], vec![])]
+            };
             let mesh_us = t1.elapsed().as_micros() as u64;
-            let _ = tx.send((coord, verts, idxs, gen_us, mesh_us));
+            let _ = tx.send((coord, lods, 0, mesh_us));
         });
     }
 
@@ -249,13 +276,14 @@ impl World {
         let rd = self.render_distance;
 
         // ── Stage 1 results ───────────────────────────────────────────────────
-        while let Ok((coord, fd)) = self.gen_rx.try_recv() {
+        while let Ok((coord, fd, chunk)) = self.gen_rx.try_recv() {
             self.gen_in_flight.remove(&coord);
             self.gen_done += 1;
 
             if (coord.x - cam_chunk.x).abs() > rd || (coord.y - cam_chunk.y).abs() > rd { continue; }
 
             self.face_data.insert(coord, fd);
+            self.pending_chunks.insert(coord, chunk);
 
             if can_mesh(coord, &self.gen_in_flight) {
                 self.spawn_mesh(coord);
@@ -284,20 +312,21 @@ impl World {
         }
 
         // ── Stage 2 results ───────────────────────────────────────────────────
-        while let Ok((coord, verts, idxs, gen_us, mesh_us)) = self.mesh_rx.try_recv() {
+        while let Ok((coord, lods, gen_us, mesh_us)) = self.mesh_rx.try_recv() {
             self.mesh_in_flight.remove(&coord);
             self.mesh_done += 1;
             self.total_gen_us  += gen_us;
             self.total_mesh_us += mesh_us;
-            let nv = verts.len();
+            let nv = lods[0].0.len(); // LOD 0 vertex count for stats
             self.total_chunk_verts += nv;
             if nv > self.max_chunk_verts { self.max_chunk_verts = nv; }
 
             if (coord.x - cam_chunk.x).abs() > rd || (coord.y - cam_chunk.y).abs() > rd { continue; }
 
             self.loaded.insert(coord);
-            if !verts.is_empty() {
-                self.cpu_meshes.insert(coord, Arc::new((verts, idxs)));
+            if !lods[0].0.is_empty() {
+                let [m0, m1, m2] = lods;
+                self.cpu_meshes.insert(coord, [Arc::new(m0), Arc::new(m1), Arc::new(m2)]);
                 self.dirty_new.push(coord);
                 self.world_dirty = true;
             }
@@ -336,12 +365,13 @@ impl World {
                     index_count,
                 ));
                 self.dst_back = 1 - back;
-                // Commit the draw params that correspond to this new layout.
+                self.needs_mesh_barrier = true;
                 match self.pending_draws.take() {
                     Some(DrawUpdate::Full(draws))       => { self.chunk_draws = draws; }
                     Some(DrawUpdate::Incremental(adds)) => { self.chunk_draws.extend(adds); }
                     None => {}
                 }
+
                 let total_verts = self.staging_vb_used / size_of::<Vertex>();
                 println!("[mesh] swapped  total_verts={total_verts}  chunks={}", self.chunk_draws.len());
             }
@@ -428,8 +458,14 @@ impl World {
             let do_full = self.staging_full_rebuild || self.staging_vb_used == 0;
 
             if do_full {
-                let vb_needed: usize = self.cpu_meshes.values().map(|c| c.0.len()).sum::<usize>() * size_of::<Vertex>();
-                let ib_needed: usize = self.cpu_meshes.values().map(|c| c.1.len()).sum::<usize>() * size_of::<u32>();
+                let vb_needed: usize = self.cpu_meshes.values()
+                    .flat_map(|lods| lods.iter())
+                    .map(|m| m.0.len())
+                    .sum::<usize>() * size_of::<Vertex>();
+                let ib_needed: usize = self.cpu_meshes.values()
+                    .flat_map(|lods| lods.iter())
+                    .map(|m| m.1.len())
+                    .sum::<usize>() * size_of::<u32>();
 
                 let vb_ok = self.staging_vb.get_or_insert_with(|| {
                     StagingBuffer::new(ctx, vb_needed.next_power_of_two()).expect("staging vb alloc")
@@ -445,23 +481,29 @@ impl World {
                     self.rebuild_pending      = true;
                     self.dirty_new.clear();
 
-                    // Snapshot preserves a stable write order; we derive per-chunk draw params
-                    // from that order on the main thread so rayon just does the memcpy work.
-                    let snapshot: Vec<(IVec2, Arc<(Vec<Vertex>, Vec<u32>)>)> =
+                    // Snapshot order is stable; derive per-chunk LOD draw params on the main
+                    // thread so rayon only does memcpy work.
+                    let snapshot: Vec<(IVec2, [Arc<(Vec<Vertex>, Vec<u32>)>; 3])> =
                         self.cpu_meshes.iter().map(|(&k, v)| (k, v.clone())).collect();
 
                     let mut new_draws = Vec::with_capacity(snapshot.len());
                     {
                         let mut first_idx = 0u32;
-                        for (coord, mesh) in &snapshot {
-                            let ic = mesh.1.len() as u32;
-                            new_draws.push((*coord, first_idx, ic));
-                            first_idx += ic;
+                        for (coord, lod_meshes) in &snapshot {
+                            let mut lod_params = [(0u32, 0u32); 3];
+                            for (lod, mesh) in lod_meshes.iter().enumerate() {
+                                let ic = mesh.1.len() as u32;
+                                lod_params[lod] = (first_idx, ic);
+                                first_idx += ic;
+                            }
+                            new_draws.push((*coord, lod_params));
                         }
                     }
                     self.pending_draws = Some(DrawUpdate::Full(new_draws));
 
-                    let snapshot_data: Vec<Arc<(Vec<Vertex>, Vec<u32>)>> =
+                    // Flatten to a list of (mesh, ...) for rayon; the write order must match
+                    // the order used to compute draw params above.
+                    let snapshot_data: Vec<[Arc<(Vec<Vertex>, Vec<u32>)>; 3]> =
                         snapshot.into_iter().map(|(_, m)| m).collect();
                     let tx     = self.rebuild_tx.clone();
                     let vb_ptr = SendPtr(self.staging_vb.as_ref().unwrap().ptr);
@@ -472,23 +514,25 @@ impl World {
                         let mut vb_off      = 0usize;
                         let mut ib_off      = 0usize;
                         let mut base_vertex = 0u32;
-                        for chunk in &snapshot_data {
-                            let (verts, idxs) = chunk.as_ref();
-                            let v_bytes = verts.len() * size_of::<Vertex>();
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    verts.as_ptr() as *const u8,
-                                    vb_ptr.get().add(vb_off),
-                                    v_bytes,
-                                );
+                        for lod_meshes in &snapshot_data {
+                            for mesh in lod_meshes.iter() {
+                                let (verts, idxs) = mesh.as_ref();
+                                let v_bytes = verts.len() * size_of::<Vertex>();
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        verts.as_ptr() as *const u8,
+                                        vb_ptr.get().add(vb_off),
+                                        v_bytes,
+                                    );
+                                }
+                                vb_off += v_bytes;
+                                let idx_dst = unsafe { ib_ptr.get().add(ib_off) as *mut u32 };
+                                for (j, &i) in idxs.iter().enumerate() {
+                                    unsafe { *idx_dst.add(j) = i + base_vertex; }
+                                }
+                                ib_off      += idxs.len() * size_of::<u32>();
+                                base_vertex += verts.len() as u32;
                             }
-                            vb_off += v_bytes;
-                            let idx_dst = unsafe { ib_ptr.get().add(ib_off) as *mut u32 };
-                            for (j, &i) in idxs.iter().enumerate() {
-                                unsafe { *idx_dst.add(j) = i + base_vertex; }
-                            }
-                            ib_off      += idxs.len() * size_of::<u32>();
-                            base_vertex += verts.len() as u32;
                         }
                         let _ = tx.send((vb_off, ib_off, t.elapsed().as_micros() as u64));
                     });
@@ -501,17 +545,28 @@ impl World {
 
                 let dirty = &self.dirty_new;
                 let cpu   = &self.cpu_meshes;
-                // Include coord so we can compute draw params before handing off to rayon.
-                let to_append: Vec<(IVec2, Arc<(Vec<Vertex>, Vec<u32>)>, usize, usize, u32)> =
-                    dirty.iter()
-                        .filter_map(|&c| cpu.get(&c).map(|m| {
-                            let entry = (c, m.clone(), cur_vb, cur_ib, cur_bv);
+                // Build per-chunk append records: all 3 LOD meshes with their staging offsets.
+                // The inner Vec is flat (lod0, lod1, lod2 in order) so the rayon task is unchanged.
+                struct ChunkAppend {
+                    coord:    IVec2,
+                    lod_work: [(Arc<(Vec<Vertex>, Vec<u32>)>, usize, usize, u32); 3],
+                    lod_params: LodDraws,
+                }
+                let to_append: Vec<ChunkAppend> = dirty.iter()
+                    .filter_map(|&c| cpu.get(&c).map(|lods| {
+                        let mut lod_work   = std::array::from_fn(|_| (Arc::new((vec![], vec![])), 0, 0, 0));
+                        let mut lod_params = [(0u32, 0u32); 3];
+                        for lod in 0..3 {
+                            let m = &lods[lod];
+                            lod_work[lod]   = (m.clone(), cur_vb, cur_ib, cur_bv);
+                            lod_params[lod] = ((cur_ib / size_of::<u32>()) as u32, m.1.len() as u32);
                             cur_vb += m.0.len() * size_of::<Vertex>();
                             cur_ib += m.1.len() * size_of::<u32>();
                             cur_bv += m.0.len() as u32;
-                            entry
-                        }))
-                        .collect();
+                        }
+                        ChunkAppend { coord: c, lod_work, lod_params }
+                    }))
+                    .collect();
 
                 let new_vb_total = cur_vb;
                 let new_ib_total = cur_ib;
@@ -534,19 +589,16 @@ impl World {
                     self.rebuild_pending  = true;
                     self.dirty_new.clear();
 
-                    // Compute per-chunk draw params for the new chunks.
-                    let inc_draws: Vec<(IVec2, u32, u32)> = to_append.iter()
-                        .map(|(coord, mesh, _, ib_off, _)| {
-                            let fi = (*ib_off / size_of::<u32>()) as u32;
-                            let ic = mesh.1.len() as u32;
-                            (*coord, fi, ic)
-                        })
+                    let inc_draws: Vec<(IVec2, LodDraws)> = to_append.iter()
+                        .map(|ca| (ca.coord, ca.lod_params))
                         .collect();
                     self.pending_draws = Some(DrawUpdate::Incremental(inc_draws));
 
-                    // Strip coord before handing to rayon (it only needs the data + offsets).
+                    // Flatten all LOD mesh work into a single list for rayon.
                     let rayon_work: Vec<(Arc<(Vec<Vertex>, Vec<u32>)>, usize, usize, u32)> =
-                        to_append.into_iter().map(|(_, m, a, b, c)| (m, a, b, c)).collect();
+                        to_append.into_iter()
+                            .flat_map(|ca| ca.lod_work.into_iter())
+                            .collect();
 
                     let tx     = self.rebuild_tx.clone();
                     let vb_ptr = SendPtr(self.staging_vb.as_ref().unwrap().ptr);
@@ -583,13 +635,14 @@ impl World {
             self.loaded.retain(|c| (c.x - cam_chunk.x).abs() <= rd && (c.y - cam_chunk.y).abs() <= rd);
             if self.loaded.len() != before {
                 self.cpu_meshes.retain(|c, _| self.loaded.contains(c));
-                self.chunk_draws.retain(|(c, _, _)| self.loaded.contains(c));
+                self.chunk_draws.retain(|(c, _)| self.loaded.contains(c));
                 self.staging_full_rebuild = true;
                 self.world_dirty = true;
             }
 
             self.face_data.retain(|c, _| (c.x - cam_chunk.x).abs() <= rd + 2 && (c.y - cam_chunk.y).abs() <= rd + 2);
             self.pending_mesh.retain(|c| (c.x - cam_chunk.x).abs() <= rd && (c.y - cam_chunk.y).abs() <= rd);
+            self.pending_chunks.retain(|c, _| self.pending_mesh.contains(c));
             self.gen_in_flight.retain(|c| (c.x - cam_chunk.x).abs() <= rd + 2 && (c.y - cam_chunk.y).abs() <= rd + 2);
             self.mesh_in_flight.retain(|c| (c.x - cam_chunk.x).abs() <= rd + 2 && (c.y - cam_chunk.y).abs() <= rd + 2);
 
@@ -636,7 +689,7 @@ impl World {
                 rayon::spawn(move || {
                     let chunk = generate(origin);
                     let fd    = ChunkFaceData::extract(&chunk);
-                    let _ = tx.send((coord, fd));
+                    let _ = tx.send((coord, fd, chunk));
                 });
             }
         }
@@ -647,14 +700,18 @@ impl World {
         self.combined.as_ref().map(|m| (m.vertex_buffer, m.index_buffer))
     }
 
-    /// Fills `out` with (first_index, index_count) for every chunk whose AABB passes
-    /// all 6 frustum planes.  Clears `out` first so the caller can reuse the allocation.
-    pub fn cull_draws(&self, planes: &[[f32; 4]; 6], out: &mut Vec<(u32, u32)>) {
+    /// Fills `out` with (first_index, index_count) for every visible chunk, selecting the
+    /// appropriate LOD level based on Chebyshev distance from the camera.
+    pub fn cull_draws(&self, planes: &[[f32; 4]; 6], camera_pos: Vec3, out: &mut Vec<(u32, u32)>) {
         out.clear();
-        for &(coord, fi, ic) in &self.chunk_draws {
-            if chunk_in_frustum(coord, planes) {
-                out.push((fi, ic));
-            }
+        let cam_cx = (camera_pos.x / CHUNK_SIZE as f32).floor() as i32;
+        let cam_cz = (camera_pos.z / CHUNK_SIZE as f32).floor() as i32;
+        for &(coord, lod_params) in &self.chunk_draws {
+            if !chunk_in_frustum(coord, planes) { continue; }
+            let dist = (coord.x - cam_cx).abs().max((coord.y - cam_cz).abs());
+            let lod  = if !ENABLE_LOD || dist < LOD1_DIST { 0 } else if dist < LOD2_DIST { 1 } else { 2 };
+            let (fi, ic) = lod_params[lod];
+            if ic > 0 { out.push((fi, ic)); }
         }
     }
 

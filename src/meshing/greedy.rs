@@ -8,6 +8,131 @@ use crate::{
     },
 };
 
+/// LOD variant: same greedy algorithm but sampled at `scale`-block intervals.
+/// Boundary faces are always emitted (no neighbour-mask lookup) — acceptable for
+/// distant chunks where the overdraw is sub-pixel.
+pub fn mesh_chunk_lod(chunk: &Chunk, scale: usize) -> (Vec<Vertex>, Vec<u32>) {
+    debug_assert!(scale > 1 && CHUNK_SIZE % scale == 0);
+    let mut vertices = Vec::new();
+    let mut indices  = Vec::new();
+
+    let cs = CHUNK_SIZE   / scale;
+    let ch = CHUNK_HEIGHT / scale;
+    let mh = ((chunk.max_height / scale) + 1).min(ch);
+
+    for dir in FaceDir::ALL {
+        if dir == FaceDir::NegY { continue; }
+        let (dl, ul, vl) = match dir {
+            FaceDir::PosX | FaceDir::NegX => (cs, mh, cs),
+            FaceDir::PosY | FaceDir::NegY => (mh, cs, cs),
+            FaceDir::PosZ | FaceDir::NegZ => (cs, cs, mh),
+        };
+
+        let mut mask = vec![None::<BlockId>; ul * vl];
+        let mut used = vec![false;          ul * vl];
+
+        for d in 0..dl {
+            mask.fill(None);
+            used.fill(false);
+
+            for u in 0..ul {
+                for v in 0..vl {
+                    // Sample one block per meta-cell (nearest-neighbour).
+                    let (bx, by, bz) = to_xyz(dir, d * scale, u * scale, v * scale);
+                    if bx >= CHUNK_SIZE || by >= CHUNK_HEIGHT || bz >= CHUNK_SIZE { continue; }
+
+                    let id = chunk.get(bx, by, bz);
+                    let Some(model) = get_model(id) else { continue };
+                    // Only full faces participate in greedy merging at LOD; skip sub-block models.
+                    if model.face(dir).map(|f| !f.is_full).unwrap_or(true) { continue; }
+                    if !lod_exposed(chunk, bx, by, bz, dir, scale) { continue; }
+
+                    mask[u * vl + v] = Some(id);
+                }
+            }
+
+            for u in 0..ul {
+                for v in 0..vl {
+                    let i = u * vl + v;
+                    if used[i] || mask[i].is_none() { continue; }
+                    let block = mask[i].unwrap();
+
+                    let mut dv = 1;
+                    while v + dv < vl && mask[u * vl + v + dv] == Some(block) { dv += 1; }
+
+                    let mut du = 1;
+                    'expand: loop {
+                        if u + du >= ul { break; }
+                        for vv in v..v + dv {
+                            if mask[(u + du) * vl + vv] != Some(block) { break 'expand; }
+                        }
+                        du += 1;
+                    }
+
+                    emit_greedy_quad_scaled(
+                        &mut vertices, &mut indices,
+                        dir, d, u, v, du, dv, scale, chunk, block,
+                    );
+
+                    for uu in u..u + du {
+                        for vv in v..v + dv {
+                            used[uu * vl + vv] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (vertices, indices)
+}
+
+/// Exposure check for LOD meshes: checks the adjacent meta-block inside the same chunk,
+/// or exposes the face unconditionally at a chunk boundary.
+fn lod_exposed(chunk: &Chunk, bx: usize, by: usize, bz: usize, dir: FaceDir, s: usize) -> bool {
+    match dir {
+        FaceDir::PosX => { let nx = bx + s; if nx >= CHUNK_SIZE   { return true; } get_model(chunk.get(nx, by, bz)).is_none() }
+        FaceDir::NegX => {                   if bx < s             { return true; } get_model(chunk.get(bx - s, by, bz)).is_none() }
+        FaceDir::PosY => { let ny = by + s; if ny >= CHUNK_HEIGHT  { return true; } get_model(chunk.get(bx, ny, bz)).is_none() }
+        FaceDir::NegY => {                   if by < s             { return true; } get_model(chunk.get(bx, by - s, bz)).is_none() }
+        FaceDir::PosZ => { let nz = bz + s; if nz >= CHUNK_SIZE   { return true; } get_model(chunk.get(bx, by, nz)).is_none() }
+        FaceDir::NegZ => {                   if bz < s             { return true; } get_model(chunk.get(bx, by, bz - s)).is_none() }
+    }
+}
+
+/// Like `emit_greedy_quad` but multiplies all coordinates by `scale` so the quad covers
+/// `scale` world units per meta-block unit.
+fn emit_greedy_quad_scaled(
+    vertices: &mut Vec<Vertex>,
+    indices:  &mut Vec<u32>,
+    dir: FaceDir,
+    d: usize, u: usize, v: usize,
+    du: usize, dv: usize,
+    scale: usize,
+    chunk: &Chunk,
+    block: BlockId,
+) {
+    let s  = scale as f32;
+    let (ox, oy, oz) = (chunk.origin.x as f32, chunk.origin.y as f32, chunk.origin.z as f32);
+    let (d, u, v, du, dv) = (d as f32 * s, u as f32 * s, v as f32 * s, du as f32 * s, dv as f32 * s);
+
+    let quad: [[f32; 3]; 4] = match dir {
+        FaceDir::PosX => [[d+s+ox, u+oy,     v+dv+oz], [d+s+ox, u+oy,     v+oz    ], [d+s+ox, u+du+oy, v+oz    ], [d+s+ox, u+du+oy, v+dv+oz]],
+        FaceDir::NegX => [[d+ox,   u+oy,     v+oz    ], [d+ox,   u+oy,     v+dv+oz], [d+ox,   u+du+oy, v+dv+oz], [d+ox,   u+du+oy, v+oz    ]],
+        FaceDir::PosY => [[u+du+ox, d+s+oy,  v+oz    ], [u+ox,   d+s+oy,  v+oz    ], [u+ox,   d+s+oy,  v+dv+oz], [u+du+ox, d+s+oy,  v+dv+oz]],
+        FaceDir::NegY => [[u+du+ox, d+oy,    v+dv+oz], [u+ox,   d+oy,    v+dv+oz], [u+ox,   d+oy,    v+oz    ], [u+du+ox, d+oy,    v+oz    ]],
+        FaceDir::PosZ => [[u+ox,    v+oy,    d+s+oz  ], [u+du+ox, v+oy,  d+s+oz  ], [u+du+ox, v+dv+oy, d+s+oz], [u+ox,    v+dv+oy, d+s+oz  ]],
+        FaceDir::NegZ => [[u+du+ox, v+oy,    d+oz    ], [u+ox,   v+oy,    d+oz   ], [u+ox,   v+dv+oy, d+oz    ], [u+du+ox, v+dv+oy, d+oz    ]],
+    };
+
+    let base   = vertices.len() as u32;
+    let normal = dir.normal();
+    let color  = block.0 as f32;
+    for pos in &quad {
+        vertices.push(Vertex { pos: *pos, normal, uv: [color, 0.0] });
+    }
+    indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+}
+
 pub fn mesh_chunk(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
@@ -16,6 +141,8 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec
     let mh = chunk.max_height + 1;
 
     for dir in FaceDir::ALL {
+        // Bottom faces are never visible in an above-ground heightmap world.
+        if dir == FaceDir::NegY { continue; }
         let (depth_len, u_len, v_len) = dir_dims(dir, mh);
 
         // Reuse allocations across depth layers

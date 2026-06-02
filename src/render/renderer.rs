@@ -91,6 +91,7 @@ impl Renderer {
         render_bufs: Option<(vk::Buffer, vk::Buffer)>,
         draws: &[(u32, u32)],
         push: PushConstants,
+        mesh_barrier: bool,
     ) -> Result<()> {
         let fences = [self.in_flight[self.current_frame]];
         unsafe { self.ctx.device.wait_for_fences(&fences, true, u64::MAX)? };
@@ -128,6 +129,7 @@ impl Renderer {
             draws,
             push,
             image_index as usize,
+            mesh_barrier,
         )?;
 
         let wait_semaphores = [self.image_available[self.current_frame]];
@@ -214,6 +216,7 @@ fn record_command_buffer(
     draws: &[(u32, u32)],
     push: PushConstants,
     image_index: usize,
+    mesh_barrier: bool,
 ) -> Result<()> {
     let begin = vk::CommandBufferBeginInfo { ..Default::default() };
     unsafe { ctx.device.begin_command_buffer(cmd, &begin)? };
@@ -274,6 +277,27 @@ fn record_command_buffer(
         );
 
         if let Some((vb, ib)) = render_bufs {
+            // On the first frame after a buffer swap the copy may not yet be visible to
+            // the vertex shader.  Emit the memory barrier that was deliberately omitted
+            // from the copy command so that intermediate renders on the same queue are not
+            // stalled.  By the time this fires the copy fence has already signalled, so the
+            // barrier resolves without any real GPU wait.
+            if mesh_barrier {
+                ctx.device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::VERTEX_INPUT,
+                    vk::DependencyFlags::empty(),
+                    &[vk::MemoryBarrier {
+                        src_access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                        dst_access_mask: vk::AccessFlags::VERTEX_ATTRIBUTE_READ
+                            | vk::AccessFlags::INDEX_READ,
+                        ..Default::default()
+                    }],
+                    &[],
+                    &[],
+                );
+            }
             ctx.device.cmd_bind_vertex_buffers(cmd, 0, &[vb], &[0]);
             ctx.device.cmd_bind_index_buffer(cmd, ib, 0, vk::IndexType::UINT32);
             for &(first_index, index_count) in draws {

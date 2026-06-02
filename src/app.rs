@@ -23,8 +23,10 @@ pub struct App {
     keys_held: HashSet<KeyCode>,
     last_frame: Instant,
     cursor_grabbed: bool,
-    fps_frame_count: u32,
-    fps_last_print: Instant,
+    frame_index: u64,
+    /// Per-frame durations (µs) accumulated for the current 1-second window.
+    frame_times_us: Vec<u32>,
+    fps_window_timer: Instant,
     draw_buf: Vec<(u32, u32)>,
     title_timer: Instant,
 }
@@ -48,8 +50,9 @@ impl App {
             keys_held: HashSet::new(),
             last_frame: Instant::now(),
             cursor_grabbed: false,
-            fps_frame_count: 0,
-            fps_last_print: Instant::now(),
+            frame_index: 0,
+            frame_times_us: Vec::new(),
+            fps_window_timer: Instant::now(),
             draw_buf: Vec::new(),
             title_timer: Instant::now(),
         })
@@ -121,22 +124,48 @@ impl App {
 
     fn render(&mut self) -> Result<()> {
         let now = Instant::now();
-        let dt = now.duration_since(self.last_frame).as_secs_f32().min(0.1);
+        let frame_dur = now.duration_since(self.last_frame);
+        let dt = frame_dur.as_secs_f32().min(0.1);
+        let frame_us = frame_dur.as_micros() as u64;
         self.last_frame = now;
 
-        self.fps_frame_count += 1;
-        let fps_elapsed = self.fps_last_print.elapsed();
-        if fps_elapsed.as_millis() >= 50 {
-            let fps = self.fps_frame_count as f64 / fps_elapsed.as_secs_f64();
-            println!("FPS: {:.0}", fps);
-            self.fps_frame_count = 0;
-            self.fps_last_print = Instant::now();
+        self.frame_index += 1;
+        self.frame_times_us.push(frame_us.min(u32::MAX as u64) as u32);
+
+        if self.fps_window_timer.elapsed().as_secs_f64() >= 1.0 {
+            self.fps_window_timer = Instant::now();
+            let times = &mut self.frame_times_us;
+            if !times.is_empty() {
+                let count = times.len();
+                let sum: u64 = times.iter().map(|&t| t as u64).sum();
+                let avg_us = sum / count as u64;
+                let min_us = *times.iter().min().unwrap() as u64;
+                let max_us = *times.iter().max().unwrap() as u64;
+                times.sort_unstable();
+                let p1_us  = times[count * 1  / 100] as u64;
+                let p99_us = times[count * 99 / 100] as u64;
+                println!(
+                    "── 1s  frames={}  avg={:.0}fps({}µs)  best={:.0}fps  worst={:.0}fps  p1={}µs  p99={}µs ──",
+                    count,
+                    1_000_000.0 / avg_us.max(1) as f64, avg_us,
+                    1_000_000.0 / min_us.max(1) as f64,
+                    1_000_000.0 / max_us.max(1) as f64,
+                    p1_us, p99_us,
+                );
+                times.clear();
+            }
         }
 
         self.camera.apply_movement(&self.keys_held, dt);
+
+        let t_update = Instant::now();
         self.world.update(self.camera.position, &self.renderer.ctx, self.renderer.command_pool());
+        let update_us = t_update.elapsed().as_micros() as u64;
+
+        let t_cull = Instant::now();
         let planes = self.camera.frustum_planes();
-        self.world.cull_draws(&planes, &mut self.draw_buf);
+        self.world.cull_draws(&planes, self.camera.position, &mut self.draw_buf);
+        let cull_us = t_cull.elapsed().as_micros() as u64;
 
         if self.title_timer.elapsed().as_millis() >= 100 {
             self.title_timer = Instant::now();
@@ -146,7 +175,22 @@ impl App {
         }
 
         let push = PushConstants { mvp: self.camera.view_proj().to_cols_array_2d() };
-        self.renderer.draw_frame(self.world.render_buffers(), &self.draw_buf, push)
+        let t_gpu = Instant::now();
+        let barrier = self.world.needs_mesh_barrier;
+        let r = self.renderer.draw_frame(self.world.render_buffers(), &self.draw_buf, push, barrier);
+        self.world.needs_mesh_barrier = false;
+        let gpu_us = t_gpu.elapsed().as_micros() as u64;
+
+        // Only print breakdown on frames that are "slow" (>2ms total) to avoid noise.
+        let total_us = update_us + cull_us + gpu_us;
+        if total_us > 2_000 {
+            println!(
+                "  └ update={}µs  cull={}µs  draw={}µs  draws={}",
+                update_us, cull_us, gpu_us, self.draw_buf.len()
+            );
+        }
+
+        r
     }
 }
 
