@@ -25,6 +25,9 @@ use crate::{
 const DESTROY_LAG: usize = 3;
 /// Max chunks uploaded per frame (bounds staging size and vkCopyBuffer count).
 const MAX_UPLOAD_BATCH: usize = 64;
+/// Persistent staging buffer sizes — large enough for MAX_UPLOAD_BATCH worst-case chunks.
+const STAGING_VB_CAP: usize = 32 << 20; // 32 MiB
+const STAGING_IB_CAP: usize =  8 << 20; //  8 MiB
 
 type GenResult  = (IVec2, ChunkFaceData, Chunk);
 type MeshResult = (IVec2, [(Vec<Vertex>, Vec<u32>); 3], u64, u64);
@@ -32,14 +35,10 @@ type MeshResult = (IVec2, [(Vec<Vertex>, Vec<u32>); 3], u64, u64);
 /// One in-flight batch upload: all LOD meshes for up to MAX_UPLOAD_BATCH chunks
 /// packed into a single staging buffer and submitted as one vkQueueSubmit.
 struct PendingBatch {
-    fence:    vk::Fence,
-    cmd:      vk::CommandBuffer,
-    stage_vb: vk::Buffer,
-    stage_vm: vk::DeviceMemory,
-    stage_ib: vk::Buffer,
-    stage_im: vk::DeviceMemory,
+    fence: vk::Fence,
+    cmd:   vk::CommandBuffer,
     /// Slots committed to chunk_allocs when the fence signals.
-    slots:    Vec<(IVec2, usize, ChunkSlot)>,
+    slots: Vec<(IVec2, usize, ChunkSlot)>,
 }
 
 pub struct World {
@@ -78,6 +77,13 @@ pub struct World {
     water_last_draw_count: u32,
 
     transfer_pool:   Option<vk::CommandPool>,
+    // Persistent staging buffers — allocated once at first upload, kept permanently mapped.
+    staging_vb:     vk::Buffer,
+    staging_vm:     vk::DeviceMemory,
+    staging_ib:     vk::Buffer,
+    staging_im:     vk::DeviceMemory,
+    staging_vb_ptr: *mut u8,
+    staging_ib_ptr: *mut u8,
     gen_rx:          Receiver<GenResult>,
     gen_tx:          Sender<GenResult>,
     mesh_rx:         Receiver<MeshResult>,
@@ -92,6 +98,16 @@ pub struct World {
     total_mesh_us:     u64,
     max_chunk_verts:   usize,
     total_chunk_verts: usize,
+
+    // ── Diagnostics (written each update(), read by app for logging) ──────────
+    pub diag_gen_rx_us:    u64,  // time spent draining gen channel
+    pub diag_mesh_rx_us:   u64,  // time spent draining mesh channel
+    pub diag_batch_poll_us: u64, // time spent polling pending batch fence
+    pub diag_upload_us:    u64,  // time spent in submit_upload_batch
+    pub diag_meshes_in:    u32,  // mesh results received this frame
+    pub diag_batch_chunks: u32,  // chunks in upload batch (0 if no batch)
+    pub diag_batch_kb:     u32,  // staging bytes used (VB+IB) in KB
+    pub diag_chunk_changed: bool, // true if player crossed a chunk boundary this frame
 }
 
 impl World {
@@ -123,6 +139,12 @@ impl World {
             last_draw_count:       0,
             water_last_draw_count: 0,
             transfer_pool:    None,
+            staging_vb:     vk::Buffer::null(),
+            staging_vm:     vk::DeviceMemory::null(),
+            staging_ib:     vk::Buffer::null(),
+            staging_im:     vk::DeviceMemory::null(),
+            staging_vb_ptr: std::ptr::null_mut(),
+            staging_ib_ptr: std::ptr::null_mut(),
             gen_rx, gen_tx, mesh_rx, mesh_tx,
             frame_idx:         0,
             stats_timer:       Instant::now(),
@@ -133,7 +155,43 @@ impl World {
             total_mesh_us:     0,
             max_chunk_verts:   0,
             total_chunk_verts: 0,
+            diag_gen_rx_us:    0,
+            diag_mesh_rx_us:   0,
+            diag_batch_poll_us: 0,
+            diag_upload_us:    0,
+            diag_meshes_in:    0,
+            diag_batch_chunks: 0,
+            diag_batch_kb:     0,
+            diag_chunk_changed: false,
         }
+    }
+
+    fn ensure_staging(&mut self, ctx: &VulkanContext) -> bool {
+        if !self.staging_vb_ptr.is_null() { return true; }
+        let (vb, vm) = match create_buffer(
+            ctx, STAGING_VB_CAP as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) { Ok(r) => r, Err(e) => { eprintln!("[staging] vb: {e}"); return false; } };
+        let (ib, im) = match create_buffer(
+            ctx, STAGING_IB_CAP as vk::DeviceSize,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        ) { Ok(r) => r, Err(e) => {
+            unsafe { ctx.device.destroy_buffer(vb, None); ctx.device.free_memory(vm, None); }
+            eprintln!("[staging] ib: {e}"); return false;
+        }};
+        unsafe {
+            let vb_ptr = ctx.device.map_memory(vm, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .expect("map staging vb") as *mut u8;
+            let ib_ptr = ctx.device.map_memory(im, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                .expect("map staging ib") as *mut u8;
+            self.staging_vb = vb; self.staging_vm = vm;
+            self.staging_ib = ib; self.staging_im = im;
+            self.staging_vb_ptr = vb_ptr;
+            self.staging_ib_ptr = ib_ptr;
+        }
+        true
     }
 
     fn ensure_transfer_pool(&mut self, ctx: &VulkanContext) -> vk::CommandPool {
@@ -275,10 +333,21 @@ impl World {
             }
         }
 
+        // Reset per-frame diagnostics.
+        self.diag_gen_rx_us    = 0;
+        self.diag_mesh_rx_us   = 0;
+        self.diag_batch_poll_us = 0;
+        self.diag_upload_us    = 0;
+        self.diag_meshes_in    = 0;
+        self.diag_batch_chunks = 0;
+        self.diag_batch_kb     = 0;
+        self.diag_chunk_changed = false;
+
         let cam_chunk = world_to_chunk(camera_pos);
         let rd = self.render_distance;
 
         // ── Poll completed upload batch ───────────────────────────────────────
+        let t_poll = Instant::now();
         if let Some(ref b) = self.pending_batch {
             if unsafe { ctx.device.get_fence_status(b.fence).unwrap_or(false) } {
                 let b = self.pending_batch.take().unwrap();
@@ -286,18 +355,17 @@ impl World {
                 unsafe {
                     ctx.device.destroy_fence(b.fence, None);
                     ctx.device.free_command_buffers(pool, &[b.cmd]);
-                    ctx.device.destroy_buffer(b.stage_vb, None);
-                    ctx.device.free_memory(b.stage_vm, None);
-                    ctx.device.destroy_buffer(b.stage_ib, None);
-                    ctx.device.free_memory(b.stage_im, None);
+                    // Staging buffers are persistent — not freed here.
                 }
                 for (coord, lod, slot) in b.slots {
                     self.chunk_allocs.entry(coord).or_insert([None; 3])[lod] = Some(slot);
                 }
             }
         }
+        self.diag_batch_poll_us = t_poll.elapsed().as_micros() as u64;
 
         // ── Stage 1 results ───────────────────────────────────────────────────
+        let t_gen = Instant::now();
         while let Ok((coord, fd, chunk)) = self.gen_rx.try_recv() {
             self.gen_in_flight.remove(&coord);
             self.gen_done += 1;
@@ -332,12 +400,15 @@ impl World {
                 }
             }
         }
+        self.diag_gen_rx_us = t_gen.elapsed().as_micros() as u64;
 
         // ── Stage 2 results ───────────────────────────────────────────────────
+        let t_mesh = Instant::now();
         while let Ok((coord, lods, _gen_us, mesh_us)) = self.mesh_rx.try_recv() {
             self.mesh_in_flight.remove(&coord);
             self.mesh_done += 1;
             self.total_mesh_us += mesh_us;
+            self.diag_meshes_in += 1;
             let nv = lods[0].0.len();
             self.total_chunk_verts += nv;
             if nv > self.max_chunk_verts { self.max_chunk_verts = nv; }
@@ -351,6 +422,7 @@ impl World {
                 self.upload_queue.push(coord);
             }
         }
+        self.diag_mesh_rx_us = t_mesh.elapsed().as_micros() as u64;
 
         // ── Periodic stats ────────────────────────────────────────────────────
         let settled = self.gen_in_flight.is_empty()
@@ -377,12 +449,15 @@ impl World {
         if self.pending_batch.is_none() && !self.upload_queue.is_empty()
             && self.arena_vb.is_some()
         {
+            let t_up = Instant::now();
             self.submit_upload_batch(ctx);
+            self.diag_upload_us = t_up.elapsed().as_micros() as u64;
         }
 
         // ── O(RD²) load/unload scan on chunk boundary ─────────────────────────
         if cam_chunk != self.last_cam_chunk {
             self.last_cam_chunk = cam_chunk;
+            self.diag_chunk_changed = true;
 
             let before = self.loaded.len();
             self.loaded.retain(|c| (c.x - cam_chunk.x).abs() <= rd && (c.y - cam_chunk.y).abs() <= rd);
@@ -522,38 +597,24 @@ impl World {
 
         if entries.is_empty() { return; }
 
-        // ── Allocate and fill staging buffers ─────────────────────────────────
-        let (stage_vb, stage_vm) = match create_buffer(
-            ctx, vb_stage_total as vk::DeviceSize,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) { Ok(r) => r, Err(e) => { eprintln!("[upload] staging vb alloc: {e}"); return; } };
+        // Record batch diagnostics before doing the heavy work.
+        self.diag_batch_chunks = to_upload.len() as u32;
+        self.diag_batch_kb     = ((vb_stage_total + ib_stage_total) / 1024) as u32;
 
-        let (stage_ib, stage_im) = match create_buffer(
-            ctx, ib_stage_total as vk::DeviceSize,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        ) { Ok(r) => r, Err(e) => {
-            unsafe { ctx.device.destroy_buffer(stage_vb, None); ctx.device.free_memory(stage_vm, None); }
-            eprintln!("[upload] staging ib alloc: {e}"); return;
-        }};
-
+        // ── Fill persistent staging buffers ───────────────────────────────────
+        if !self.ensure_staging(ctx) { return; }
+        if vb_stage_total > STAGING_VB_CAP || ib_stage_total > STAGING_IB_CAP {
+            eprintln!("[upload] staging overflow vb={vb_stage_total} ib={ib_stage_total}");
+            return;
+        }
         unsafe {
-            let vb_ptr = ctx.device.map_memory(stage_vm, 0, vb_stage_total as vk::DeviceSize, vk::MemoryMapFlags::empty())
-                .expect("map stage_vm") as *mut u8;
-            let ib_ptr = ctx.device.map_memory(stage_im, 0, ib_stage_total as vk::DeviceSize, vk::MemoryMapFlags::empty())
-                .expect("map stage_im") as *mut u8;
-
             for e in &entries {
                 let (verts, idxs) = self.cpu_meshes[&e.coord][e.lod].as_ref();
                 std::ptr::copy_nonoverlapping(
-                    verts.as_ptr() as *const u8, vb_ptr.add(e.vb_stage), e.slot.vb_size);
+                    verts.as_ptr() as *const u8, self.staging_vb_ptr.add(e.vb_stage), e.slot.vb_size);
                 std::ptr::copy_nonoverlapping(
-                    idxs.as_ptr()  as *const u8, ib_ptr.add(e.ib_stage), e.slot.ib_size);
+                    idxs.as_ptr()  as *const u8, self.staging_ib_ptr.add(e.ib_stage), e.slot.ib_size);
             }
-
-            ctx.device.unmap_memory(stage_vm);
-            ctx.device.unmap_memory(stage_im);
         }
 
         // ── Record and submit one command buffer with all copies ───────────────
@@ -576,12 +637,12 @@ impl World {
             }).expect("begin cmd");
 
             for e in &entries {
-                ctx.device.cmd_copy_buffer(cmd, stage_vb, arena_vb, &[vk::BufferCopy {
+                ctx.device.cmd_copy_buffer(cmd, self.staging_vb, arena_vb, &[vk::BufferCopy {
                     src_offset: e.vb_stage as vk::DeviceSize,
                     dst_offset: e.slot.vb_offset as vk::DeviceSize,
                     size:       e.slot.vb_size as vk::DeviceSize,
                 }]);
-                ctx.device.cmd_copy_buffer(cmd, stage_ib, arena_ib, &[vk::BufferCopy {
+                ctx.device.cmd_copy_buffer(cmd, self.staging_ib, arena_ib, &[vk::BufferCopy {
                     src_offset: e.ib_stage as vk::DeviceSize,
                     dst_offset: e.slot.ib_offset as vk::DeviceSize,
                     size:       e.slot.ib_size as vk::DeviceSize,
@@ -604,7 +665,7 @@ impl World {
         }
 
         let slots = entries.into_iter().map(|e| (e.coord, e.lod, e.slot)).collect();
-        self.pending_batch = Some(PendingBatch { fence, cmd, stage_vb, stage_vm, stage_ib, stage_im, slots });
+        self.pending_batch = Some(PendingBatch { fence, cmd, slots });
     }
 
     /// Returns the arena vertex and index buffer handles.
@@ -704,12 +765,20 @@ impl World {
                     let _ = ctx.device.wait_for_fences(&[b.fence], true, u64::MAX);
                     ctx.device.destroy_fence(b.fence, None);
                     ctx.device.free_command_buffers(pool, &[b.cmd]);
-                    ctx.device.destroy_buffer(b.stage_vb, None);
-                    ctx.device.free_memory(b.stage_vm, None);
-                    ctx.device.destroy_buffer(b.stage_ib, None);
-                    ctx.device.free_memory(b.stage_im, None);
                 }
             }
+        }
+        if !self.staging_vb_ptr.is_null() {
+            unsafe {
+                ctx.device.unmap_memory(self.staging_vm);
+                ctx.device.destroy_buffer(self.staging_vb, None);
+                ctx.device.free_memory(self.staging_vm, None);
+                ctx.device.unmap_memory(self.staging_im);
+                ctx.device.destroy_buffer(self.staging_ib, None);
+                ctx.device.free_memory(self.staging_im, None);
+            }
+            self.staging_vb_ptr = std::ptr::null_mut();
+            self.staging_ib_ptr = std::ptr::null_mut();
         }
         for bucket in &mut self.deferred_frees { bucket.clear(); }
         if let Some(ref a) = self.arena_vb { a.destroy(ctx); }
@@ -724,6 +793,9 @@ impl World {
         self.indirect_bufs = [None, None];
     }
 }
+
+// World is only ever used from the main thread; the raw staging pointers are safe to Send.
+unsafe impl Send for World {}
 
 fn chunk_in_frustum(coord: IVec2, planes: &[[f32; 4]; 6]) -> bool {
     let min_x = coord.x as f32 * CHUNK_SIZE as f32;

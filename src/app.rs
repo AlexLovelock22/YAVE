@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use winit::{
@@ -33,6 +33,10 @@ pub struct App {
     draw_buf:       Vec<vk::DrawIndexedIndirectCommand>,
     draw_buf_water: Vec<vk::DrawIndexedIndirectCommand>,
     title_timer: Instant,
+    /// End time of the per-frame burst window triggered by crossing a chunk boundary.
+    chunk_burst_until: Instant,
+    /// Throttle for the normal (non-burst) periodic log line (~2/sec).
+    slow_log_timer: Instant,
 }
 
 impl App {
@@ -60,6 +64,8 @@ impl App {
             draw_buf:       Vec::new(),
             draw_buf_water: Vec::new(),
             title_timer: Instant::now(),
+            chunk_burst_until: Instant::now(),
+            slow_log_timer: Instant::now(),
         })
     }
 
@@ -187,14 +193,38 @@ impl App {
         let r = self.renderer.draw_frame(self.world.render_buffers(), self.world.indirect_draw(), self.world.indirect_draw_water(), push);
         let gpu_us = t_gpu.elapsed().as_micros() as u64;
 
-        // Only print breakdown on frames that are "slow" (>2ms total) to avoid noise.
         let total_us = update_us + cull_us + gpu_us;
-        // if total_us > 2_000 {
-        //     println!(
-        //         "  └ update={}µs  cull={}µs  draw={}µs  draws={}",
-        //         update_us, cull_us, gpu_us, self.draw_buf.len()
-        //     );
-        // }
+        let d = &self.world;
+
+        // Extend burst window whenever the player crosses a chunk boundary.
+        if d.diag_chunk_changed {
+            self.chunk_burst_until = now + Duration::from_secs(1);
+        }
+
+        // Log every frame during a chunk-crossing burst; otherwise throttle to ~2/sec.
+        let in_burst = now < self.chunk_burst_until;
+        let slow_log = self.slow_log_timer.elapsed() >= Duration::from_millis(500);
+        if slow_log {
+            self.slow_log_timer = now;
+        }
+
+        if in_burst || slow_log {
+            let verts: u32 = self.draw_buf.iter().map(|c| c.index_count * 2 / 3).sum();
+            // println!(
+            //     "[f{:>6}] total={:>5}µs | update={:>4}µs \
+            //      (poll={:>3}µs gen_rx={:>3}µs mesh_rx={:>3}µs upload={:>4}µs) \
+            //      | cull={:>3}µs gpu={:>4}µs \
+            //      | draws={:>3} water={:>3} verts={:>6} \
+            //      | mesh_in={} batch={}chunks/{}KB",
+            //     self.frame_index,
+            //     total_us, update_us,
+            //     d.diag_batch_poll_us, d.diag_gen_rx_us,
+            //     d.diag_mesh_rx_us, d.diag_upload_us,
+            //     cull_us, gpu_us,
+            //     self.draw_buf.len(), self.draw_buf_water.len(), verts,
+            //     d.diag_meshes_in, d.diag_batch_chunks, d.diag_batch_kb,
+            // );
+        }
 
         r
     }
