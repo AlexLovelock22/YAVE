@@ -6,11 +6,12 @@ use ash::vk;
 use super::{buffer::create_buffer, context::VulkanContext};
 
 // Layer order must match face_tex() in world/block.rs
-const LAYER_FILES: [(&str, [u8; 4]); 4] = [
+const LAYER_FILES: [(&str, [u8; 4]); 5] = [
     ("Stone.png",      [128, 128, 128, 255]),
     ("Dirt.png",       [101,  67,  33, 255]),
     ("Grass_Top.png",  [ 85, 139,  48, 255]),
     ("Grass_Side.png", [ 69, 108,  45, 255]),
+    ("Water.png",      [ 44, 120, 220, 255]),
 ];
 const LAYER_COUNT: u32 = LAYER_FILES.len() as u32;
 
@@ -29,11 +30,15 @@ impl TextureArray {
         let tex_dir = Path::new("Textures");
         std::fs::create_dir_all(tex_dir)?;
 
-        // Generate solid-color placeholders for any missing files.
+        // Generate placeholders for any missing texture files.
         for (filename, rgba) in &LAYER_FILES {
             let path = tex_dir.join(filename);
             if !path.exists() {
-                let img = image::RgbaImage::from_pixel(24, 24, image::Rgba(*rgba));
+                let img = if *filename == "Water.png" {
+                    gen_water_texture()
+                } else {
+                    image::RgbaImage::from_pixel(24, 24, image::Rgba(*rgba))
+                };
                 img.save(&path)?;
                 println!("[texture] created placeholder {filename}");
             }
@@ -287,4 +292,22 @@ impl TextureArray {
             ctx.device.free_memory(self.memory, None);
         }
     }
+}
+
+fn gen_water_texture() -> image::RgbaImage {
+    use std::f32::consts::TAU;
+    image::RgbaImage::from_fn(24, 24, |u, v| {
+        let uf = u as f32 / 24.0;
+        let vf = v as f32 / 24.0;
+        // Three overlapping waves at different frequencies/angles for a ripple look.
+        let w1 = (uf * TAU * 4.0 + vf * TAU * 1.5).sin();
+        let w2 = ((uf + vf) * TAU * 3.0).sin() * 0.55;
+        let w3 = (uf * TAU * 6.0 - vf * TAU * 2.0).cos() * 0.35;
+        let t = ((w1 + w2 + w3) / 1.9 * 0.5 + 0.5).clamp(0.0, 1.0);
+        // Wide dark-to-light range so the pattern is visible through 30% opacity.
+        let r = ( 8.0 + t * 70.0) as u8;    //  8..78
+        let g = (50.0 + t * 130.0) as u8;   // 50..180
+        let b = (150.0 + t * 95.0) as u8;   // 150..245
+        image::Rgba([r, g, b, 255])
+    })
 }

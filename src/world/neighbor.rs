@@ -1,5 +1,5 @@
 use crate::world::{
-    block::get_model,
+    block::{get_model, is_opaque},
     chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE},
 };
 
@@ -37,19 +37,19 @@ impl ChunkFaceData {
         for y in 0..CHUNK_HEIGHT {
             for z in 0..CHUNK_SIZE {
                 let bit = y * CHUNK_SIZE + z;
-                if get_model(chunk.get(0, y, z)).is_some() {
+                if is_opaque(chunk.get(0, y, z)) {
                     neg_x[bit / 8] |= 1 << (bit % 8);
                 }
-                if get_model(chunk.get(CHUNK_SIZE - 1, y, z)).is_some() {
+                if is_opaque(chunk.get(CHUNK_SIZE - 1, y, z)) {
                     pos_x[bit / 8] |= 1 << (bit % 8);
                 }
             }
             for x in 0..CHUNK_SIZE {
                 let bit = y * CHUNK_SIZE + x;
-                if get_model(chunk.get(x, y, 0)).is_some() {
+                if is_opaque(chunk.get(x, y, 0)) {
                     neg_z[bit / 8] |= 1 << (bit % 8);
                 }
-                if get_model(chunk.get(x, y, CHUNK_SIZE - 1)).is_some() {
+                if is_opaque(chunk.get(x, y, CHUNK_SIZE - 1)) {
                     pos_z[bit / 8] |= 1 << (bit % 8);
                 }
             }

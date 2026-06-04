@@ -92,8 +92,9 @@ impl Renderer {
 
     pub fn draw_frame(
         &mut self,
-        render_bufs: Option<(vk::Buffer, vk::Buffer)>,
-        indirect: Option<(vk::Buffer, u32)>,
+        render_bufs:   Option<(vk::Buffer, vk::Buffer)>,
+        indirect:      Option<(vk::Buffer, u32)>,
+        water_indirect: Option<(vk::Buffer, u32)>,
         push: PushConstants,
     ) -> Result<()> {
         let fences = [self.in_flight[self.current_frame]];
@@ -130,6 +131,7 @@ impl Renderer {
             &self.pipeline,
             render_bufs,
             indirect,
+            water_indirect,
             push,
             self.texture.desc_set,
             image_index as usize,
@@ -216,8 +218,9 @@ fn record_command_buffer(
     cmd: vk::CommandBuffer,
     sc: &Swapchain,
     pipeline: &Pipeline,
-    render_bufs: Option<(vk::Buffer, vk::Buffer)>,
-    indirect: Option<(vk::Buffer, u32)>,
+    render_bufs:    Option<(vk::Buffer, vk::Buffer)>,
+    indirect:       Option<(vk::Buffer, u32)>,
+    water_indirect: Option<(vk::Buffer, u32)>,
     push: PushConstants,
     desc_set: vk::DescriptorSet,
     image_index: usize,
@@ -313,6 +316,25 @@ fn record_command_buffer(
                     draw_count,
                     std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
+
+                // Water pass: depth writes off so the transparent surface doesn't
+                // corrupt the depth buffer for geometry behind/beside it.
+                if let Some((water_buf, water_count)) = water_indirect {
+                    if water_count > 0 {
+                        ctx.device.cmd_bind_pipeline(
+                            cmd,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            pipeline.water_pipeline,
+                        );
+                        ctx.device.cmd_draw_indexed_indirect(
+                            cmd,
+                            water_buf,
+                            0,
+                            water_count,
+                            std::mem::size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+                        );
+                    }
+                }
             }
         }
         ctx.device.cmd_end_render_pass(cmd);

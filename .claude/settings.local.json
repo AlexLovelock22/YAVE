@@ -17,7 +17,10 @@
       "PowerShell(Get-Process | Where-Object { $_.MainWindowTitle -ne \"\" } | Select-Object Name, Id, MainWindowTitle | Format-Table -AutoSize)",
       "PowerShell(Stop-Process -Name \"yave\" -Force -ErrorAction SilentlyContinue)",
       "Bash(Get-ChildItem -Path \"C:\\\\Users\\\\kloak\\\\YAVE\" -Recurse -Include *.rs -ErrorAction SilentlyContinue)",
-      "Bash(Select-Object -ExpandProperty FullName)"
+      "Bash(Select-Object -ExpandProperty FullName)",
+      "Bash(python3 -c \"from PIL import Image; img = Image.open\\('Textures/water.png'\\); print\\(img.size, img.mode\\)\")",
+      "Bash(powershell -Command 'Add-Type -AssemblyName System.Drawing; $img = [System.Drawing.Image]::FromFile\\('\\\\''C:/Users/kloak/YAVE/Textures/water.png'\\\\''\\); Write-Output \"$\\($img.Width\\)x$\\($img.Height\\)\"')",
+      "Bash(Remove-Item \"c:/Users/kloak/YAVE/Textures/water.png\" -Force)"
     ]
   }
 }

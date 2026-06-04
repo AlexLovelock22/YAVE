@@ -20,7 +20,7 @@ impl Camera {
             pitch: -0.3,
             fov_y: 90_f32.to_radians(),
             aspect,
-            speed: 200.0,
+            speed: 20.0,
         }
     }
 
@@ -61,7 +61,7 @@ impl Camera {
     }
 
     pub fn look(&mut self, delta_x: f32, delta_y: f32) {
-        self.yaw -= delta_x * 0.005;
+        self.yaw -= delta_x * 0.002;
         self.pitch = (self.pitch - delta_y * 0.005)
             .clamp(-std::f32::consts::FRAC_PI_2 + 0.001, std::f32::consts::FRAC_PI_2 - 0.001);
     }

@@ -17,5 +17,13 @@ void main() {
     float diffuse    = max(dot(normalize(frag_normal), light_dir), 0.0);
     float brightness = 0.25 + diffuse * 0.75;
 
-    out_color = vec4(texel.rgb * brightness, texel.a);
+    bool is_water = (layer == 4.0);
+    if (is_water) {
+        // Use abs(dot) so the surface looks lit correctly from both above and below.
+        float diffuse_ds  = abs(dot(normalize(frag_normal), light_dir));
+        float brightness2 = 0.35 + diffuse_ds * 0.65;
+        out_color = vec4(texel.rgb * brightness2, 0.80);
+    } else {
+        out_color = vec4(texel.rgb * brightness, 1.0);
+    }
 }

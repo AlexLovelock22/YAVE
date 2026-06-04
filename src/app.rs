@@ -30,7 +30,8 @@ pub struct App {
     /// Per-frame durations (µs) accumulated for the current 1-second window.
     frame_times_us: Vec<u32>,
     fps_window_timer: Instant,
-    draw_buf: Vec<vk::DrawIndexedIndirectCommand>,
+    draw_buf:       Vec<vk::DrawIndexedIndirectCommand>,
+    draw_buf_water: Vec<vk::DrawIndexedIndirectCommand>,
     title_timer: Instant,
 }
 
@@ -56,7 +57,8 @@ impl App {
             frame_index: 0,
             frame_times_us: Vec::new(),
             fps_window_timer: Instant::now(),
-            draw_buf: Vec::new(),
+            draw_buf:       Vec::new(),
+            draw_buf_water: Vec::new(),
             title_timer: Instant::now(),
         })
     }
@@ -167,20 +169,22 @@ impl App {
 
         let t_cull = Instant::now();
         let planes = self.camera.frustum_planes();
-        self.world.cull_draws(&planes, self.camera.position, &mut self.draw_buf);
+        self.world.cull_draws(&planes, self.camera.position, &mut self.draw_buf, &mut self.draw_buf_water);
         self.world.flush_indirect(&self.draw_buf, &self.renderer.ctx);
+        self.world.flush_indirect_water(&self.draw_buf_water, &self.renderer.ctx);
         let cull_us = t_cull.elapsed().as_micros() as u64;
 
         if self.title_timer.elapsed().as_millis() >= 100 {
             self.title_timer = Instant::now();
+            let fps = 1_000_000.0 / frame_us.max(1) as f64;
             // index_count * 2/3 = vertex count (every quad is 4 verts / 6 indices).
             let verts: u32 = self.draw_buf.iter().map(|c| c.index_count * 2 / 3).sum();
-            self.window.set_title(&format!("YAVE  |  {} verts  |  {} chunks", verts, self.draw_buf.len()));
+            self.window.set_title(&format!("YAVE  |  {:.0} fps  |  {} verts  |  {} chunks", fps, verts, self.draw_buf.len()));
         }
 
         let push = PushConstants { mvp: self.camera.view_proj().to_cols_array_2d() };
         let t_gpu = Instant::now();
-        let r = self.renderer.draw_frame(self.world.render_buffers(), self.world.indirect_draw(), push);
+        let r = self.renderer.draw_frame(self.world.render_buffers(), self.world.indirect_draw(), self.world.indirect_draw_water(), push);
         let gpu_us = t_gpu.elapsed().as_micros() as u64;
 
         // Only print breakdown on frames that are "slow" (>2ms total) to avoid noise.

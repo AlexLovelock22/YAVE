@@ -7,7 +7,7 @@ use ash::vk;
 use glam::{IVec2, IVec3, Vec3};
 
 use crate::{
-    meshing::greedy::{mesh_chunk, mesh_chunk_surface},
+    meshing::greedy::{mesh_chunk, mesh_chunk_surface, mesh_chunk_water},
     render::{
         buffer::create_buffer,
         context::VulkanContext,
@@ -71,9 +71,11 @@ pub struct World {
     deferred_frees:  Vec<Vec<ChunkSlot>>,
     /// Double-buffered GPU indirect command buffers — one per in-flight frame slot.
     /// Alternated each frame so the CPU never writes to the buffer the GPU is reading.
-    indirect_bufs:   [Option<IndirectBuffer>; 2],
-    indirect_frame:  usize,
-    last_draw_count: u32,
+    indirect_bufs:         [Option<IndirectBuffer>; 2],
+    water_indirect_bufs:   [Option<IndirectBuffer>; 2],
+    indirect_frame:        usize,
+    last_draw_count:       u32,
+    water_last_draw_count: u32,
 
     transfer_pool:   Option<vk::CommandPool>,
     gen_rx:          Receiver<GenResult>,
@@ -115,9 +117,11 @@ impl World {
             upload_queue:     Vec::new(),
             pending_batch:    None,
             deferred_frees:   (0..DESTROY_LAG).map(|_| Vec::new()).collect(),
-            indirect_bufs:    [None, None],
-            indirect_frame:   0,
-            last_draw_count:  0,
+            indirect_bufs:         [None, None],
+            water_indirect_bufs:   [None, None],
+            indirect_frame:        0,
+            last_draw_count:       0,
+            water_last_draw_count: 0,
             transfer_pool:    None,
             gen_rx, gen_tx, mesh_rx, mesh_tx,
             frame_idx:         0,
@@ -203,7 +207,7 @@ impl World {
                 || mesh_chunk(&chunk, &neighbors),
                 || rayon::join(
                     || mesh_chunk_surface(&chunk, &neighbors),
-                    || (Vec::new(), Vec::new()), // LOD2 unused; cull_draws falls back to LOD1
+                    || mesh_chunk_water(&chunk, &neighbors), // water-only; drawn after opaque
                 ),
             );
             let mesh_us = t1.elapsed().as_micros() as u64;
@@ -235,9 +239,10 @@ impl World {
         if self.indirect_bufs[0].is_none() {
             let cap = ((2 * self.render_distance + 1) as usize).pow(2);
             for slot in &mut self.indirect_bufs {
-                if let Ok(buf) = IndirectBuffer::new(ctx, cap) {
-                    *slot = Some(buf);
-                }
+                if let Ok(buf) = IndirectBuffer::new(ctx, cap) { *slot = Some(buf); }
+            }
+            for slot in &mut self.water_indirect_bufs {
+                if let Ok(buf) = IndirectBuffer::new(ctx, cap) { *slot = Some(buf); }
             }
         }
 
@@ -610,35 +615,45 @@ impl World {
         }
     }
 
-    /// Frustum-cull loaded chunks, select LOD, and fill `out` with indirect draw commands.
+    /// Frustum-cull loaded chunks and fill separate opaque and water draw lists.
+    /// LOD0/LOD1 slots are opaque geometry; LOD2 is water-only geometry.
+    /// Caller must submit opaque draw before water draw for correct alpha blending.
     pub fn cull_draws(
         &self,
         planes: &[[f32; 4]; 6],
         camera_pos: Vec3,
-        out: &mut Vec<vk::DrawIndexedIndirectCommand>,
+        out_opaque: &mut Vec<vk::DrawIndexedIndirectCommand>,
+        out_water:  &mut Vec<vk::DrawIndexedIndirectCommand>,
     ) {
-        out.clear();
+        out_opaque.clear();
+        out_water.clear();
         let cam_cx = (camera_pos.x / CHUNK_SIZE as f32).floor() as i32;
         let cam_cz = (camera_pos.z / CHUNK_SIZE as f32).floor() as i32;
 
+        let push = |s: ChunkSlot, out: &mut Vec<vk::DrawIndexedIndirectCommand>| {
+            out.push(vk::DrawIndexedIndirectCommand {
+                index_count:    s.index_count,
+                instance_count: 1,
+                first_index:    s.first_index,
+                vertex_offset:  s.vertex_base,
+                first_instance: 0,
+            });
+        };
+
         for (&coord, _) in &self.cpu_meshes {
             if !chunk_in_frustum(coord, planes) { continue; }
-            let dist = (coord.x - cam_cx).abs().max((coord.y - cam_cz).abs());
-            let desired = if dist < self.lod1_dist { 0usize }
-                          else if dist < self.lod2_dist { 1 }
-                          else { 2 };
-
             let allocs = match self.chunk_allocs.get(&coord) { Some(a) => a, None => continue };
-            // Try desired LOD first, then fall back to whichever is ready.
-            let slot = [desired, 0, 1, 2].iter().find_map(|&l| allocs[l]);
-            if let Some(s) = slot {
-                out.push(vk::DrawIndexedIndirectCommand {
-                    index_count:    s.index_count,
-                    instance_count: 1,
-                    first_index:    s.first_index,
-                    vertex_offset:  s.vertex_base,
-                    first_instance: 0,
-                });
+
+            // Opaque: LOD0/LOD1 only — LOD2 is reserved for water.
+            let dist = (coord.x - cam_cx).abs().max((coord.y - cam_cz).abs());
+            let desired = if dist < self.lod1_dist { 0usize } else { 1 };
+            if let Some(s) = [desired, 0, 1].iter().find_map(|&l| allocs[l]) {
+                push(s, out_opaque);
+            }
+
+            // Water: always LOD2.
+            if let Some(s) = allocs[2] {
+                push(s, out_water);
             }
         }
     }
@@ -663,6 +678,24 @@ impl World {
         self.indirect_bufs[slot].as_ref().map(|b| (b.buffer, self.last_draw_count))
     }
 
+    /// Write the water draw list into the water indirect buffer (same frame slot as opaque).
+    /// Call after `flush_indirect`.
+    pub fn flush_indirect_water(&mut self, cmds: &[vk::DrawIndexedIndirectCommand], ctx: &VulkanContext) {
+        self.water_last_draw_count = cmds.len() as u32;
+        let slot = self.indirect_frame % 2;
+        if let Some(ref mut buf) = self.water_indirect_bufs[slot] {
+            if let Err(e) = buf.ensure_cap(ctx, cmds.len().max(1)) {
+                eprintln!("[indirect water] grow: {e}"); return;
+            }
+            buf.write(cmds);
+        }
+    }
+
+    pub fn indirect_draw_water(&self) -> Option<(vk::Buffer, u32)> {
+        let slot = self.indirect_frame % 2;
+        self.water_indirect_bufs[slot].as_ref().map(|b| (b.buffer, self.water_last_draw_count))
+    }
+
     pub fn destroy(&mut self, ctx: &VulkanContext) {
         // Wait for any in-flight batch, then free its resources.
         if let Some(b) = self.pending_batch.take() {
@@ -681,7 +714,8 @@ impl World {
         for bucket in &mut self.deferred_frees { bucket.clear(); }
         if let Some(ref a) = self.arena_vb { a.destroy(ctx); }
         if let Some(ref a) = self.arena_ib { a.destroy(ctx); }
-        for slot in &self.indirect_bufs { if let Some(ref b) = slot { b.destroy(ctx); } }
+        for slot in &self.indirect_bufs       { if let Some(ref b) = slot { b.destroy(ctx); } }
+        for slot in &self.water_indirect_bufs { if let Some(ref b) = slot { b.destroy(ctx); } }
         if let Some(pool) = self.transfer_pool.take() {
             unsafe { ctx.device.destroy_command_pool(pool, None); }
         }
@@ -743,7 +777,9 @@ fn generate(origin: IVec3) -> Chunk {
 
             if is_ocean[idx] {
                 chunk.set(x, sy, z, STONE);
-                for y in (sy + 1)..=SEA_LEVEL { chunk.set(x, y, z, WATER); }
+                for y in (sy + 1)..=SEA_LEVEL {
+                    chunk.set(x, y, z, WATER);
+                }
             } else {
                 chunk.set(x, sy, z, DIRT);
             }

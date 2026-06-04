@@ -2,8 +2,9 @@ use crate::{
     models::face::{FaceDir, FaceGeometry},
     render::mesh::Vertex,
     world::{
-        block::{face_tex, get_model, BlockId},
+        block::{face_tex, get_model, is_opaque, BlockId, WATER},
         chunk::{Chunk, CHUNK_HEIGHT, CHUNK_SIZE},
+        continents::SEA_LEVEL,
         neighbor::{mask_solid, NeighborMasks, FACE_BYTES},
     },
 };
@@ -27,7 +28,7 @@ pub fn mesh_chunk_surface(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vert
         for z in 0..cs {
             for y in (0..=mh).rev() {
                 let b = chunk.get(x, y, z);
-                if get_model(b).is_some() {
+                if is_opaque(b) {
                     surf[x * cs + z] = Some((b, y));
                     break;
                 }
@@ -111,7 +112,7 @@ pub fn mesh_chunk_surface(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vert
             let start = (nh + 1).max(0) as usize;
             for y in start..=th as usize {
                 let b = chunk.get(d, y, lat);
-                if get_model(b).is_some() { mask[lat * row + y] = Some(b); }
+                if is_opaque(b) { mask[lat * row + y] = Some(b); }
             }
         }
         for lat in 0..cs {
@@ -152,7 +153,7 @@ pub fn mesh_chunk_surface(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vert
             let start = (nh + 1).max(0) as usize;
             for y in start..=th as usize {
                 let b = chunk.get(d, y, lat);
-                if get_model(b).is_some() { mask[lat * row + y] = Some(b); }
+                if is_opaque(b) { mask[lat * row + y] = Some(b); }
             }
         }
         for lat in 0..cs {
@@ -194,7 +195,7 @@ pub fn mesh_chunk_surface(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vert
             let start = (nh + 1).max(0) as usize;
             for y in start..=th as usize {
                 let b = chunk.get(lat, y, d);
-                if get_model(b).is_some() { mask[lat * row + y] = Some(b); }
+                if is_opaque(b) { mask[lat * row + y] = Some(b); }
             }
         }
         for lat in 0..cs {
@@ -235,7 +236,7 @@ pub fn mesh_chunk_surface(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vert
             let start = (nh + 1).max(0) as usize;
             for y in start..=th as usize {
                 let b = chunk.get(lat, y, d);
-                if get_model(b).is_some() { mask[lat * row + y] = Some(b); }
+                if is_opaque(b) { mask[lat * row + y] = Some(b); }
             }
         }
         for lat in 0..cs {
@@ -272,8 +273,8 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec
     let mh = chunk.max_height + 1;
 
     for dir in FaceDir::ALL {
-        // Bottom faces are never visible in an above-ground heightmap world.
-        if dir == FaceDir::NegY { continue; }
+        // NegY is invisible for solid terrain, but water needs its underside
+        // (visible when underwater looking up). Skipped per-block below.
         let (depth_len, u_len, v_len) = dir_dims(dir, mh);
 
         // Reuse allocations across depth layers
@@ -289,7 +290,11 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec
                 for v in 0..v_len {
                     let (x, y, z) = to_xyz(dir, d, u, v);
                     let id = chunk.get(x, y, z);
+                    // Water is emitted in a separate pass (mesh_chunk_water) so it can
+                    // be drawn after all opaque geometry for correct alpha blending.
+                    if dir == FaceDir::NegY { continue; }
                     let Some(model) = get_model(id) else { continue };
+                    if id == WATER { continue; }
                     let Some(face) = model.face(dir) else { continue };
                     if !is_exposed(chunk, neighbors, x, y, z, dir) { continue; }
 
@@ -387,7 +392,7 @@ fn is_exposed(chunk: &Chunk, neighbors: &NeighborMasks, x: usize, y: usize, z: u
             FaceDir::PosY | FaceDir::NegY => true,
         };
     }
-    get_model(chunk.get(nx, ny, nz)).is_none()
+    !is_opaque(chunk.get(nx, ny, nz))
 }
 
 // ── Quad emitters ────────────────────────────────────────────────────────────
@@ -432,6 +437,69 @@ fn emit_model_face(
         });
     }
     indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
+}
+
+/// Water surface mesh: per-column greedy merge so the water edge follows the
+/// exact coastline. The stencil buffer (water pipeline) prevents any pixel from
+/// being alpha-blended more than once, so chunk-boundary seams are impossible.
+pub fn mesh_chunk_water(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec<u32>) {
+    // Fast-exit for land chunks with no water.
+    let has_water = (0..CHUNK_SIZE).any(|x|
+        (0..CHUNK_SIZE).any(|z| chunk.get(x, SEA_LEVEL, z) == WATER)
+    );
+    if !has_water { return (vec![], vec![]); }
+
+    let cs = CHUNK_SIZE;
+    let mh = chunk.max_height;
+    let mut vertices = Vec::new();
+    let mut indices  = Vec::new();
+    let mut mask = vec![None::<usize>; cs * cs];
+    let mut used = vec![false; cs * cs];
+
+    // Find the topmost exposed water face per XZ column.
+    for x in 0..cs {
+        for z in 0..cs {
+            for y in (0..=mh).rev() {
+                if chunk.get(x, y, z) != WATER { continue; }
+                if is_exposed(chunk, neighbors, x, y, z, FaceDir::PosY) {
+                    mask[x * cs + z] = Some(y);
+                }
+                break;
+            }
+        }
+    }
+
+    // 2D greedy merge over same-height XZ cells.
+    for x in 0..cs {
+        for z in 0..cs {
+            let i = x * cs + z;
+            if used[i] { continue; }
+            let Some(y0) = mask[i] else { continue };
+
+            let mut dz = 1;
+            while z + dz < cs && mask[x * cs + z + dz] == Some(y0) { dz += 1; }
+            let mut dx = 1;
+            'ex: loop {
+                if x + dx >= cs { break; }
+                for zz in z..z + dz {
+                    if mask[(x + dx) * cs + zz] != Some(y0) { break 'ex; }
+                }
+                dx += 1;
+            }
+
+            emit_greedy_quad(&mut vertices, &mut indices, FaceDir::PosY, y0, x, z, dx, dz, chunk, WATER);
+            // Drop 0.1 below block top so water sits below coast terrain at y+1,
+            // avoiding Z-fighting where land and water share the same grid row.
+            let base = vertices.len() - 4;
+            for v in &mut vertices[base..] { v.pos[1] -= 0.1; }
+
+            for xx in x..x + dx {
+                for zz in z..z + dz { used[xx * cs + zz] = true; }
+            }
+        }
+    }
+
+    (vertices, indices)
 }
 
 /// Emit a merged quad covering a du×dv rectangle at depth d in (u, v) slice space.

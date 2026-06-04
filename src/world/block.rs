@@ -18,6 +18,7 @@ pub const TEX_STONE:      u32 = 0;
 pub const TEX_DIRT:       u32 = 1;
 pub const TEX_GRASS_TOP:  u32 = 2;
 pub const TEX_GRASS_SIDE: u32 = 3;
+pub const TEX_WATER:      u32 = 4;
 
 /// Returns the texture array layer index for a given block face.
 pub fn face_tex(id: BlockId, dir: FaceDir) -> u32 {
@@ -27,8 +28,15 @@ pub fn face_tex(id: BlockId, dir: FaceDir) -> u32 {
             FaceDir::NegY => TEX_DIRT,
             _             => TEX_GRASS_SIDE,
         },
+        WATER => TEX_WATER,
         _ => TEX_STONE,
     }
+}
+
+/// True if `id` is a solid, opaque block that occludes neighbours.
+/// Water has geometry but is transparent — it never occludes adjacent faces.
+pub fn is_opaque(id: BlockId) -> bool {
+    id != AIR && id != WATER && get_model(id).is_some()
 }
 
 pub fn get_model(id: BlockId) -> Option<BlockModel> {

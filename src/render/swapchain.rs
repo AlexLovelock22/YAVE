@@ -171,7 +171,7 @@ fn create_depth_resources(
     ctx: &VulkanContext,
     extent: vk::Extent2D,
 ) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-    let format = vk::Format::D32_SFLOAT;
+    let format = vk::Format::D32_SFLOAT_S8_UINT;
     let image_info = vk::ImageCreateInfo {
         image_type: vk::ImageType::TYPE_2D,
         format,
@@ -201,7 +201,7 @@ fn create_depth_resources(
     let memory = unsafe { ctx.device.allocate_memory(&alloc_info, None)? };
     unsafe { ctx.device.bind_image_memory(image, memory, 0)? };
 
-    let view = create_image_view(&ctx.device, image, format, vk::ImageAspectFlags::DEPTH)?;
+    let view = create_image_view(&ctx.device, image, format, vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)?;
     Ok((image, memory, view))
 }
 

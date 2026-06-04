@@ -9,18 +9,21 @@ pub struct Pipeline {
     pub render_pass: vk::RenderPass,
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
+    pub water_pipeline: vk::Pipeline,
 }
 
 impl Pipeline {
     pub fn new(ctx: &VulkanContext, color_format: vk::Format, desc_layout: vk::DescriptorSetLayout) -> Result<Self> {
         let render_pass = create_render_pass(&ctx.device, color_format)?;
-        let (layout, pipeline) = create_pipeline(&ctx.device, render_pass, desc_layout)?;
-        Ok(Self { render_pass, layout, pipeline })
+        let (layout, pipeline) = create_pipeline(&ctx.device, render_pass, desc_layout, true)?;
+        let water_pipeline = create_water_pipeline(&ctx.device, render_pass, layout)?;
+        Ok(Self { render_pass, layout, pipeline, water_pipeline })
     }
 }
 
 pub fn destroy(ctx: &VulkanContext, p: &Pipeline) {
     unsafe {
+        ctx.device.destroy_pipeline(p.water_pipeline, None);
         ctx.device.destroy_pipeline(p.pipeline, None);
         ctx.device.destroy_pipeline_layout(p.layout, None);
         ctx.device.destroy_render_pass(p.render_pass, None);
@@ -43,11 +46,11 @@ fn create_render_pass(
         ..Default::default()
     };
     let depth_attachment = vk::AttachmentDescription {
-        format: vk::Format::D32_SFLOAT,
+        format: vk::Format::D32_SFLOAT_S8_UINT,
         samples: vk::SampleCountFlags::TYPE_1,
         load_op: vk::AttachmentLoadOp::CLEAR,
         store_op: vk::AttachmentStoreOp::DONT_CARE,
-        stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+        stencil_load_op: vk::AttachmentLoadOp::CLEAR,
         stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
         initial_layout: vk::ImageLayout::UNDEFINED,
         final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -103,6 +106,7 @@ fn create_pipeline(
     device: &ash::Device,
     render_pass: vk::RenderPass,
     desc_layout: vk::DescriptorSetLayout,
+    depth_write: bool,
 ) -> Result<(vk::PipelineLayout, vk::Pipeline)> {
     let vert_spv = include_bytes!(concat!(env!("OUT_DIR"), "/voxel.vert.spv"));
     let frag_spv = include_bytes!(concat!(env!("OUT_DIR"), "/voxel.frag.spv"));
@@ -165,14 +169,19 @@ fn create_pipeline(
     };
     let depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
         depth_test_enable: vk::TRUE,
-        depth_write_enable: vk::TRUE,
+        depth_write_enable: if depth_write { vk::TRUE } else { vk::FALSE },
         depth_compare_op: vk::CompareOp::LESS,
         ..Default::default()
     };
     let blend_attachment = vk::PipelineColorBlendAttachmentState {
         color_write_mask: vk::ColorComponentFlags::RGBA,
-        blend_enable: vk::FALSE,
-        ..Default::default()
+        blend_enable: vk::TRUE,
+        src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
+        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ONE,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
     };
     let blend_attachments = [blend_attachment];
     let color_blending = vk::PipelineColorBlendStateCreateInfo {
@@ -233,6 +242,149 @@ fn create_pipeline(
     }
 
     Ok((layout, pipeline))
+}
+
+/// Water variant: same shaders/layout but depth writes disabled so transparent
+/// water surfaces don't corrupt the depth buffer for geometry behind them.
+fn create_water_pipeline(
+    device: &ash::Device,
+    render_pass: vk::RenderPass,
+    layout: vk::PipelineLayout,
+) -> Result<vk::Pipeline> {
+    let vert_spv = include_bytes!(concat!(env!("OUT_DIR"), "/voxel.vert.spv"));
+    let frag_spv = include_bytes!(concat!(env!("OUT_DIR"), "/voxel.frag.spv"));
+    let vert_module = create_shader_module(device, vert_spv)?;
+    let frag_module = create_shader_module(device, frag_spv)?;
+
+    let entry_name = c"main";
+    let stages = [
+        vk::PipelineShaderStageCreateInfo {
+            stage: vk::ShaderStageFlags::VERTEX,
+            module: vert_module,
+            p_name: entry_name.as_ptr(),
+            ..Default::default()
+        },
+        vk::PipelineShaderStageCreateInfo {
+            stage: vk::ShaderStageFlags::FRAGMENT,
+            module: frag_module,
+            p_name: entry_name.as_ptr(),
+            ..Default::default()
+        },
+    ];
+
+    let binding = vk::VertexInputBindingDescription {
+        binding: 0,
+        stride: std::mem::size_of::<super::mesh::Vertex>() as u32,
+        input_rate: vk::VertexInputRate::VERTEX,
+    };
+    let attrs = [
+        vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
+        vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 12 },
+        vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32_SFLOAT, offset: 24 },
+    ];
+    let bindings = [binding];
+    let vertex_input = vk::PipelineVertexInputStateCreateInfo {
+        vertex_binding_description_count: bindings.len() as u32,
+        p_vertex_binding_descriptions: bindings.as_ptr(),
+        vertex_attribute_description_count: attrs.len() as u32,
+        p_vertex_attribute_descriptions: attrs.as_ptr(),
+        ..Default::default()
+    };
+    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo {
+        topology: vk::PrimitiveTopology::TRIANGLE_LIST,
+        primitive_restart_enable: vk::FALSE,
+        ..Default::default()
+    };
+    let viewport_state = vk::PipelineViewportStateCreateInfo {
+        viewport_count: 1,
+        scissor_count: 1,
+        ..Default::default()
+    };
+    let rasterizer = vk::PipelineRasterizationStateCreateInfo {
+        polygon_mode: vk::PolygonMode::FILL,
+        cull_mode: vk::CullModeFlags::NONE, // double-sided: visible from above and below waterline
+        front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+        line_width: 1.0,
+        ..Default::default()
+    };
+    let multisampling = vk::PipelineMultisampleStateCreateInfo {
+        rasterization_samples: vk::SampleCountFlags::TYPE_1,
+        ..Default::default()
+    };
+    // Stencil prevents any pixel from being alpha-blended more than once.
+    // First water fragment passes EQUAL(0), renders, increments stencil to 1.
+    // Any subsequent water at the same pixel fails the stencil → no double-blend.
+    let water_stencil = vk::StencilOpState {
+        fail_op:       vk::StencilOp::KEEP,
+        pass_op:       vk::StencilOp::INCREMENT_AND_CLAMP,
+        depth_fail_op: vk::StencilOp::KEEP,
+        compare_op:    vk::CompareOp::EQUAL,
+        compare_mask:  0xFF,
+        write_mask:    0xFF,
+        reference:     0,
+    };
+    let depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
+        depth_test_enable:   vk::TRUE,
+        depth_write_enable:  vk::TRUE,
+        depth_compare_op:    vk::CompareOp::LESS_OR_EQUAL,
+        stencil_test_enable: vk::TRUE,
+        front: water_stencil,
+        back:  water_stencil,
+        ..Default::default()
+    };
+    let blend_attachment = vk::PipelineColorBlendAttachmentState {
+        color_write_mask: vk::ColorComponentFlags::RGBA,
+        blend_enable: vk::TRUE,
+        src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
+        dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
+        color_blend_op: vk::BlendOp::ADD,
+        src_alpha_blend_factor: vk::BlendFactor::ONE,
+        dst_alpha_blend_factor: vk::BlendFactor::ZERO,
+        alpha_blend_op: vk::BlendOp::ADD,
+    };
+    let blend_attachments = [blend_attachment];
+    let color_blending = vk::PipelineColorBlendStateCreateInfo {
+        attachment_count: blend_attachments.len() as u32,
+        p_attachments: blend_attachments.as_ptr(),
+        ..Default::default()
+    };
+    let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo {
+        dynamic_state_count: dynamic_states.len() as u32,
+        p_dynamic_states: dynamic_states.as_ptr(),
+        ..Default::default()
+    };
+
+    let pipeline_info = vk::GraphicsPipelineCreateInfo {
+        stage_count: stages.len() as u32,
+        p_stages: stages.as_ptr(),
+        p_vertex_input_state: &vertex_input,
+        p_input_assembly_state: &input_assembly,
+        p_viewport_state: &viewport_state,
+        p_rasterization_state: &rasterizer,
+        p_multisample_state: &multisampling,
+        p_depth_stencil_state: &depth_stencil,
+        p_color_blend_state: &color_blending,
+        p_dynamic_state: &dynamic_state,
+        layout,
+        render_pass,
+        subpass: 0,
+        base_pipeline_index: -1,
+        ..Default::default()
+    };
+
+    let pipeline = unsafe {
+        device
+            .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+            .map_err(|(_, e)| e)?[0]
+    };
+
+    unsafe {
+        device.destroy_shader_module(vert_module, None);
+        device.destroy_shader_module(frag_module, None);
+    }
+
+    Ok(pipeline)
 }
 
 fn create_shader_module(device: &ash::Device, spv: &[u8]) -> Result<vk::ShaderModule> {
