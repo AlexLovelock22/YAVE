@@ -90,13 +90,11 @@ impl Renderer {
         })
     }
 
-    pub fn draw_frame(
-        &mut self,
-        render_bufs:   Option<(vk::Buffer, vk::Buffer)>,
-        indirect:      Option<(vk::Buffer, u32)>,
-        water_indirect: Option<(vk::Buffer, u32)>,
-        push: PushConstants,
-    ) -> Result<()> {
+    /// Wait for the in-flight fence and acquire the next swapchain image.
+    /// Returns `Ok(None)` when the swapchain is out of date (caller should skip the frame).
+    /// MUST be called before writing the indirect buffer: the fence wait here is what
+    /// guarantees the previous-previous frame is no longer reading that buffer slot.
+    pub fn begin_frame(&mut self) -> Result<Option<u32>> {
         let fences = [self.in_flight[self.current_frame]];
         unsafe { self.ctx.device.wait_for_fences(&fences, true, u64::MAX)? };
 
@@ -111,12 +109,24 @@ impl Renderer {
 
         let image_index = match acquire_result {
             Ok((idx, _)) => idx,
-            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(()),
+            Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
 
         unsafe { self.ctx.device.reset_fences(&fences)? };
+        Ok(Some(image_index))
+    }
 
+    /// Record and submit the render command buffer for `image_index`.
+    /// Must be called after `begin_frame` returns `Some(image_index)`.
+    pub fn end_frame(
+        &mut self,
+        image_index:   u32,
+        render_bufs:   Option<(vk::Buffer, vk::Buffer)>,
+        indirect:      Option<(vk::Buffer, u32)>,
+        water_indirect: Option<(vk::Buffer, u32)>,
+        push: PushConstants,
+    ) -> Result<()> {
         let cmd = self.command_buffers[self.current_frame];
         unsafe {
             self.ctx

@@ -173,9 +173,21 @@ impl App {
         self.world.update(self.camera.position, &self.renderer.ctx);
         let update_us = t_update.elapsed().as_micros() as u64;
 
+        // Frustum cull while the GPU may still be finishing the previous-previous frame —
+        // this CPU work overlaps with GPU work for free.
         let t_cull = Instant::now();
         let planes = self.camera.frustum_planes();
         self.world.cull_draws(&planes, self.camera.position, &mut self.draw_buf, &mut self.draw_buf_water);
+
+        // begin_frame waits for the in-flight fence BEFORE we write the indirect buffer.
+        // Without this ordering the CPU can overwrite an indirect buffer slot that the GPU
+        // is still reading, causing random chunks to flicker every other frame.
+        let t_gpu = Instant::now();
+        let image_index = match self.renderer.begin_frame()? {
+            Some(idx) => idx,
+            None => return Ok(()),
+        };
+
         self.world.flush_indirect(&self.draw_buf, &self.renderer.ctx);
         self.world.flush_indirect_water(&self.draw_buf_water, &self.renderer.ctx);
         let cull_us = t_cull.elapsed().as_micros() as u64;
@@ -189,8 +201,7 @@ impl App {
         }
 
         let push = PushConstants { mvp: self.camera.view_proj().to_cols_array_2d() };
-        let t_gpu = Instant::now();
-        let r = self.renderer.draw_frame(self.world.render_buffers(), self.world.indirect_draw(), self.world.indirect_draw_water(), push);
+        let r = self.renderer.end_frame(image_index, self.world.render_buffers(), self.world.indirect_draw(), self.world.indirect_draw_water(), push);
         let gpu_us = t_gpu.elapsed().as_micros() as u64;
 
         let total_us = update_us + cull_us + gpu_us;
