@@ -3,6 +3,7 @@
 layout(location = 0) in vec3 in_pos;
 layout(location = 1) in vec3 in_normal;
 layout(location = 2) in vec2 in_uv;
+layout(location = 3) in float in_ao;
 
 layout(push_constant) uniform PushConstants {
     mat4 mvp;
@@ -10,9 +11,11 @@ layout(push_constant) uniform PushConstants {
 
 layout(location = 0) out vec3 frag_normal;
 layout(location = 1) out vec2 frag_uv;
+layout(location = 2) out float frag_ao;
 
 void main() {
     gl_Position = pc.mvp * vec4(in_pos, 1.0);
     frag_normal = in_normal;
-    frag_uv = in_uv;
+    frag_uv     = in_uv;
+    frag_ao     = in_ao;
 }

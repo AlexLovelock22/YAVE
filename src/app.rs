@@ -134,6 +134,12 @@ impl App {
     }
 
     fn render(&mut self) -> Result<()> {
+        const MIN_FRAME: Duration = Duration::from_nanos(666_667); // 1500 FPS cap
+        let elapsed = self.last_frame.elapsed();
+        if elapsed < MIN_FRAME {
+            std::thread::sleep(MIN_FRAME - elapsed);
+        }
+
         let now = Instant::now();
         let frame_dur = now.duration_since(self.last_frame);
         let dt = frame_dur.as_secs_f32().min(0.1);
@@ -201,7 +207,7 @@ impl App {
         }
 
         let push = PushConstants { mvp: self.camera.view_proj().to_cols_array_2d() };
-        let r = self.renderer.end_frame(image_index, self.world.render_buffers(), self.world.indirect_draw(), self.world.indirect_draw_water(), push);
+        let r = self.renderer.end_frame(image_index, self.world.render_buffers(), self.world.indirect_draw(), self.world.indirect_draw_water(), push, self.camera.proj_matrix());
         let gpu_us = t_gpu.elapsed().as_micros() as u64;
 
         let total_us = update_us + cull_us + gpu_us;

@@ -2,6 +2,7 @@
 
 layout(location = 0) in vec3 frag_normal;
 layout(location = 1) in vec2 frag_uv;
+layout(location = 2) in float frag_ao;
 
 layout(set = 0, binding = 0) uniform sampler2DArray tex_array;
 
@@ -15,13 +16,12 @@ void main() {
 
     vec3 light_dir   = normalize(vec3(0.6, 1.0, 0.4));
     float diffuse    = max(dot(normalize(frag_normal), light_dir), 0.0);
-    float brightness = 0.25 + diffuse * 0.75;
+    float brightness = (0.35 + diffuse * 0.65) * pow(frag_ao, 1.8);
 
     bool is_water = (layer == 4.0);
     if (is_water) {
-        // Use abs(dot) so the surface looks lit correctly from both above and below.
         float diffuse_ds  = abs(dot(normalize(frag_normal), light_dir));
-        float brightness2 = 0.35 + diffuse_ds * 0.65;
+        float brightness2 = (0.35 + diffuse_ds * 0.65) * mix(0.5, 1.0, frag_ao);
         out_color = vec4(texel.rgb * brightness2, 0.80);
     } else {
         out_color = vec4(texel.rgb * brightness, 1.0);

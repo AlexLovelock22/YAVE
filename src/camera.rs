@@ -54,10 +54,14 @@ impl Camera {
     }
 
     pub fn view_proj(&self) -> Mat4 {
-        let view = Mat4::look_at_rh(self.position, self.position + self.forward(), Vec3::Y);
-        let proj = Mat4::perspective_rh(self.fov_y, self.aspect, 0.1, 10000.0);
+        self.proj_matrix() * Mat4::look_at_rh(self.position, self.position + self.forward(), Vec3::Y)
+    }
+
+    /// Projection matrix only (includes Vulkan Y-flip). Used by the SSAO pass.
+    pub fn proj_matrix(&self) -> Mat4 {
+        let proj   = Mat4::perspective_rh(self.fov_y, self.aspect, 0.1, 10000.0);
         let flip_y = Mat4::from_scale(Vec3::new(1.0, -1.0, 1.0));
-        flip_y * proj * view
+        flip_y * proj
     }
 
     pub fn look(&mut self, delta_x: f32, delta_y: f32) {

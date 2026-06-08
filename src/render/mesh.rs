@@ -8,9 +8,10 @@ use super::{buffer::{create_buffer, create_staging_and_dst, upload_device_local,
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Vertex {
-    pub pos: [f32; 3],
+    pub pos:    [f32; 3],
     pub normal: [f32; 3],
-    pub uv: [f32; 2],  // [u_tile,  v_tile + layer_index * 256.0]
+    pub uv:     [f32; 2],  // [u_tile,  v_tile + layer_index * 256.0]
+    pub ao:     f32,        // per-vertex ambient occlusion [0=dark, 1=bright]
 }
 
 #[repr(C)]
@@ -105,7 +106,7 @@ impl GpuMesh {
                 let base = vertices.len() as u32;
                 let normal = dir.normal();
                 for i in 0..4 {
-                    vertices.push(Vertex { pos: face.verts[i], normal, uv: [face.uvs[i][0], face.uvs[i][1] + face.texture as f32 * 256.0] });
+                    vertices.push(Vertex { pos: face.verts[i], normal, uv: [face.uvs[i][0], face.uvs[i][1] + face.texture as f32 * 256.0], ao: 1.0 });
                 }
                 indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
             }
