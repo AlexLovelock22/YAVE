@@ -84,7 +84,11 @@ fn face_ao(chunk: &Chunk, neighbors: &NeighborMasks, bx: usize, by: usize, bz: u
         let side1  = ao_solid(chunk, neighbors, bx + s1.0, by + s1.1, bz + s1.2);
         let side2  = ao_solid(chunk, neighbors, bx + s2.0, by + s2.1, bz + s2.2);
         let corner = ao_solid(chunk, neighbors, bx +  c.0, by +  c.1, bz +  c.2);
-        result[i] = if side1 || side2 || corner { 2 } else { 3 };
+        result[i] = if side1 && side2 {
+            1
+        } else {
+            (3 - side1 as u8 - side2 as u8 - corner as u8).max(2)
+        };
     }
     result
 }
@@ -618,7 +622,9 @@ fn emit_greedy_quad(
             ao:     vertex_ao[i],
         });
     }
-    if vertex_ao[0] + vertex_ao[2] < vertex_ao[1] + vertex_ao[3] {
+    let sum_02 = vertex_ao[0] + vertex_ao[2];
+    let sum_13 = vertex_ao[1] + vertex_ao[3];
+    if sum_02 < sum_13 || (sum_02 == sum_13 && vertex_ao[0] != vertex_ao[1]) {
         indices.extend_from_slice(&[base, base+1, base+3, base+1, base+2, base+3]);
     } else {
         indices.extend_from_slice(&[base, base+1, base+2, base, base+2, base+3]);
