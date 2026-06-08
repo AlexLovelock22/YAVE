@@ -25,9 +25,11 @@ use crate::{
 const DESTROY_LAG: usize = 3;
 /// Max chunks uploaded per frame (bounds staging size and vkCopyBuffer count).
 const MAX_UPLOAD_BATCH: usize = 64;
-/// Persistent staging buffer sizes — large enough for MAX_UPLOAD_BATCH worst-case chunks.
-const STAGING_VB_CAP: usize = 32 << 20; // 32 MiB
-const STAGING_IB_CAP: usize =  8 << 20; //  8 MiB
+/// Persistent staging buffer sizes.
+/// AO meshing produces much larger vertex buffers than pre-AO (36B/vertex, less greedy merging).
+/// 128 MiB VB / 64 chunks ≈ 2 MiB/chunk headroom — enough for any realistic terrain chunk.
+const STAGING_VB_CAP: usize = 128 << 20; // 128 MiB
+const STAGING_IB_CAP: usize =  32 << 20; //  32 MiB
 
 type GenResult  = (IVec2, ChunkFaceData, Chunk);
 type MeshResult = (IVec2, [(Vec<Vertex>, Vec<u32>); 3], u64, u64);
@@ -280,8 +282,10 @@ impl World {
             // LOD0 and LOD1 are both full-resolution (surface mesher), so budget ~5000 bytes/chunk
             // for VB and ~800 bytes/chunk for IB across both LODs combined.
             let chunks = ((2 * self.render_distance + 1) as usize).pow(2);
-            let vb_cap = (chunks * 5_000).next_power_of_two().clamp(256 << 20, 512 << 20);
-            let ib_cap = (chunks *   800).next_power_of_two().clamp( 64 << 20, 128 << 20);
+            // AO mesh: 36 B/vertex, ~4 K verts LOD0 for near chunks + ~1 K verts LOD1 for all.
+            // LOD0 is only uploaded for the lod0 band; budget ~60 KB/chunk covers both bands.
+            let vb_cap = (chunks * 60_000).next_power_of_two().clamp(512 << 20, 2048 << 20);
+            let ib_cap = (chunks * 10_000).next_power_of_two().clamp(128 << 20,  512 << 20);
             match (
                 ArenaBuffer::new(ctx, vb_cap, vk::BufferUsageFlags::VERTEX_BUFFER, size_of::<Vertex>()),
                 ArenaBuffer::new(ctx, ib_cap, vk::BufferUsageFlags::INDEX_BUFFER,  size_of::<u32>()),
@@ -400,6 +404,20 @@ impl World {
                 }
             }
         }
+
+        // Every-frame catch: unblock pending_mesh entries that became meshable this frame.
+        // Runs unconditionally (not just on camera move) so stationary-camera loads don't stall
+        // when a gen-in-flight neighbour was culled by retain without completing.
+        {
+            let unblocked: Vec<IVec2> = self.pending_mesh.iter()
+                .filter(|&&c| can_mesh(c, &self.gen_in_flight))
+                .copied().collect();
+            for coord in unblocked {
+                self.pending_mesh.remove(&coord);
+                if !self.mesh_in_flight.contains(&coord) { self.spawn_mesh(coord); }
+            }
+        }
+
         self.diag_gen_rx_us = t_gen.elapsed().as_micros() as u64;
 
         // ── Stage 2 results ───────────────────────────────────────────────────
@@ -432,17 +450,17 @@ impl World {
         if !settled && self.stats_timer.elapsed().as_millis() >= 500 {
             self.stats_timer = Instant::now();
             let n = self.mesh_done.max(1) as u64;
-            // println!(
-            //     "[chunks] gen {}/{}  mesh {}/{}  fly {} pend {} mfly {}  \
-            //      avg_mesh {}us  max_verts {} avg_verts {}  queue {}",
-            //     self.gen_done, self.gen_spawned,
-            //     self.mesh_done, self.gen_spawned,
-            //     self.gen_in_flight.len(), self.pending_mesh.len(), self.mesh_in_flight.len(),
-            //     self.total_mesh_us / n,
-            //     self.max_chunk_verts,
-            //     self.total_chunk_verts / self.mesh_done.max(1) as usize,
-            //     self.upload_queue.len(),
-            // );
+            println!(
+                "[chunks] gen {}/{}  mesh {}/{}  fly {} pend {} mfly {}  \
+                 avg_mesh {}us  max_verts {} avg_verts {}  queue {}",
+                self.gen_done, self.gen_spawned,
+                self.mesh_done, self.gen_spawned,
+                self.gen_in_flight.len(), self.pending_mesh.len(), self.mesh_in_flight.len(),
+                self.total_mesh_us / n,
+                self.max_chunk_verts,
+                self.total_chunk_verts / self.mesh_done.max(1) as usize,
+                self.upload_queue.len(),
+            );
         }
 
         // ── Submit upload batch (one per frame max) ───────────────────────────
@@ -450,7 +468,7 @@ impl World {
             && self.arena_vb.is_some()
         {
             let t_up = Instant::now();
-            self.submit_upload_batch(ctx);
+            self.submit_upload_batch(ctx, cam_chunk);
             self.diag_upload_us = t_up.elapsed().as_micros() as u64;
         }
 
@@ -526,12 +544,21 @@ impl World {
                 self.gen_spawned += 1;
                 self.spawn_queue.push_back(coord);
             }
+
+            // When the camera moves into the lod0 band for a chunk that only has LOD1
+            // uploaded (because it was distant when first loaded), queue its LOD0 upload.
+            for (&coord, allocs) in &self.chunk_allocs {
+                let dist = (coord.x - cam_chunk.x).abs().max((coord.y - cam_chunk.y).abs());
+                if dist < self.lod1_dist && allocs[0].is_none() && self.cpu_meshes.contains_key(&coord) {
+                    self.upload_queue.push(coord);
+                }
+            }
         }
     }
 
     /// Build and submit a single command buffer covering all pending chunk LOD uploads.
     /// Called at most once per frame (only when no batch is in flight).
-    fn submit_upload_batch(&mut self, ctx: &VulkanContext) {
+    fn submit_upload_batch(&mut self, ctx: &VulkanContext, cam_chunk: IVec2) {
         let pool = self.ensure_transfer_pool(ctx);
 
         // Drain up to MAX_UPLOAD_BATCH coords from upload_queue.
@@ -553,7 +580,13 @@ impl World {
 
         for coord in &to_upload {
             let lods = match self.cpu_meshes.get(coord) { Some(m) => m.clone(), None => continue };
+            let dist = (coord.x - cam_chunk.x).abs().max((coord.y - cam_chunk.y).abs());
             for lod in 0..3usize {
+                // Skip LOD0 for distant chunks — they only render LOD1, and uploading LOD0 for
+                // every chunk would drive the arena from ~600 MiB to ~2 GiB, causing repeated
+                // queue_wait_idle stalls when the arena grows.  LOD0 is queued on approach
+                // (see camera-move block above).
+                if lod == 0 && dist >= self.lod1_dist { continue; }
                 let (verts, idxs) = lods[lod].as_ref();
                 if verts.is_empty() { continue; }
 
@@ -595,7 +628,16 @@ impl World {
             }
         }
 
-        if entries.is_empty() { return; }
+        if entries.is_empty() {
+            // All coords failed alloc (arena not yet ready or every LOD was empty/skipped).
+            // Re-queue so they're retried next frame rather than being silently dropped.
+            let remaining = std::mem::take(&mut self.upload_queue);
+            self.upload_queue = to_upload.into_iter()
+                .filter(|c| self.cpu_meshes.contains_key(c))
+                .chain(remaining)
+                .collect();
+            return;
+        }
 
         // Record batch diagnostics before doing the heavy work.
         self.diag_batch_chunks = to_upload.len() as u32;
@@ -604,7 +646,18 @@ impl World {
         // ── Fill persistent staging buffers ───────────────────────────────────
         if !self.ensure_staging(ctx) { return; }
         if vb_stage_total > STAGING_VB_CAP || ib_stage_total > STAGING_IB_CAP {
-            eprintln!("[upload] staging overflow vb={vb_stage_total} ib={ib_stage_total}");
+            eprintln!("[upload] staging overflow vb={vb_stage_total} ib={ib_stage_total} — re-queuing {} chunks", to_upload.len());
+            // Free the arena slots we just allocated so the space isn't wasted.
+            for e in &entries {
+                if let Some(ref mut a) = self.arena_vb { a.free(e.slot.vb_offset, e.slot.vb_size); }
+                if let Some(ref mut a) = self.arena_ib { a.free(e.slot.ib_offset, e.slot.ib_size); }
+            }
+            // Put the drained chunks back at the front of the queue so they're retried.
+            let remaining = std::mem::take(&mut self.upload_queue);
+            self.upload_queue = to_upload.into_iter()
+                .filter(|c| self.cpu_meshes.contains_key(c))
+                .chain(remaining)
+                .collect();
             return;
         }
         unsafe {
