@@ -1,6 +1,2 @@
 cargo:rerun-if-changed=shaders/voxel.vert
 cargo:rerun-if-changed=shaders/voxel.frag
-cargo:rerun-if-changed=shaders/fullscreen.vert
-cargo:rerun-if-changed=shaders/ssao.frag
-cargo:rerun-if-changed=shaders/composite.frag
-cargo:rerun-if-changed=shaders/blur.frag

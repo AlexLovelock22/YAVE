@@ -20,7 +20,9 @@
       "Bash(Select-Object -ExpandProperty FullName)",
       "Bash(python3 -c \"from PIL import Image; img = Image.open\\('Textures/water.png'\\); print\\(img.size, img.mode\\)\")",
       "Bash(powershell -Command 'Add-Type -AssemblyName System.Drawing; $img = [System.Drawing.Image]::FromFile\\('\\\\''C:/Users/kloak/YAVE/Textures/water.png'\\\\''\\); Write-Output \"$\\($img.Width\\)x$\\($img.Height\\)\"')",
-      "Bash(Remove-Item \"c:/Users/kloak/YAVE/Textures/water.png\" -Force)"
+      "Bash(Remove-Item \"c:/Users/kloak/YAVE/Textures/water.png\" -Force)",
+      "Bash(Remove-Item \"c:\\\\Users\\\\kloak\\\\YAVE\\\\shaders\\\\ssao.frag\", \"c:\\\\Users\\\\kloak\\\\YAVE\\\\shaders\\\\blur.frag\", \"c:\\\\Users\\\\kloak\\\\YAVE\\\\shaders\\\\composite.frag\", \"c:\\\\Users\\\\kloak\\\\YAVE\\\\shaders\\\\fullscreen.vert\" -ErrorAction Stop)",
+      "Bash(Write-Output \"Deleted\")"
     ]
   }
 }

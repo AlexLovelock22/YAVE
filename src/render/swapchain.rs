@@ -3,38 +3,18 @@ use ash::{vk, Device};
 
 use super::context::VulkanContext;
 
-/// The Vulkan swapchain plus the offscreen render targets used by the SSAO pipeline.
-///
-/// Framebuffers are NOT stored here — they are owned by the Renderer so that the
-/// Pipeline's render-pass handles are available when the Swapchain is recreated.
 pub struct Swapchain {
-    pub loader:    ash::khr::swapchain::Device,
-    pub swapchain: vk::SwapchainKHR,
-    pub images:    Vec<vk::Image>,
+    pub loader:      ash::khr::swapchain::Device,
+    pub swapchain:   vk::SwapchainKHR,
+    pub images:      Vec<vk::Image>,
     pub image_views: Vec<vk::ImageView>,
-    pub extent: vk::Extent2D,
-    pub format: vk::Format,
+    pub extent:      vk::Extent2D,
+    pub format:      vk::Format,
 
-    // ── Offscreen scene colour (R8G8B8A8_UNORM) ──────────────────────────
-    pub scene_color_image:  vk::Image,
-    pub scene_color_memory: vk::DeviceMemory,
-    pub scene_color_view:   vk::ImageView,
-
-    // ── Shared depth buffer (D32_SFLOAT_S8_UINT) ─────────────────────────
-    pub depth_image:       vk::Image,
-    pub depth_memory:      vk::DeviceMemory,
-    pub depth_view:        vk::ImageView,  // depth + stencil aspect (for the framebuffer)
-    pub depth_sample_view: vk::ImageView,  // depth-only aspect     (for SSAO sampler)
-
-    // ── Raw AO result (R8_UNORM) ─────────────────────────────────────────
-    pub ao_image:  vk::Image,
-    pub ao_memory: vk::DeviceMemory,
-    pub ao_view:   vk::ImageView,
-
-    // ── Blurred AO result (R8_UNORM) ─────────────────────────────────────
-    pub ao_blurred_image:  vk::Image,
-    pub ao_blurred_memory: vk::DeviceMemory,
-    pub ao_blurred_view:   vk::ImageView,
+    // ── Depth buffer (D32_SFLOAT_S8_UINT) ────────────────────────────────────
+    pub depth_image:  vk::Image,
+    pub depth_memory: vk::DeviceMemory,
+    pub depth_view:   vk::ImageView,
 }
 
 impl Swapchain {
@@ -64,19 +44,9 @@ fn destroy_images(ctx: &VulkanContext, sc: &Swapchain) {
         for &iv in &sc.image_views {
             d.destroy_image_view(iv, None);
         }
-        d.destroy_image_view(sc.scene_color_view, None);
-        d.destroy_image(sc.scene_color_image, None);
-        d.free_memory(sc.scene_color_memory, None);
-        d.destroy_image_view(sc.depth_sample_view, None);
         d.destroy_image_view(sc.depth_view, None);
         d.destroy_image(sc.depth_image, None);
         d.free_memory(sc.depth_memory, None);
-        d.destroy_image_view(sc.ao_view, None);
-        d.destroy_image(sc.ao_image, None);
-        d.free_memory(sc.ao_memory, None);
-        d.destroy_image_view(sc.ao_blurred_view, None);
-        d.destroy_image(sc.ao_blurred_image, None);
-        d.free_memory(sc.ao_blurred_memory, None);
     }
 }
 
@@ -141,20 +111,7 @@ fn build(
         .map(|&img| make_view(&ctx.device, img, fmt.format, vk::ImageAspectFlags::COLOR))
         .collect::<Result<Vec<_>>>()?;
 
-    let (scene_color_image, scene_color_memory, scene_color_view) =
-        create_color_image(ctx, extent, vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)?;
-
-    let (depth_image, depth_memory, depth_view, depth_sample_view) =
-        create_depth_image(ctx, extent)?;
-
-    let (ao_image, ao_memory, ao_view) =
-        create_color_image(ctx, extent, vk::Format::R8_UNORM,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)?;
-
-    let (ao_blurred_image, ao_blurred_memory, ao_blurred_view) =
-        create_color_image(ctx, extent, vk::Format::R8_UNORM,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)?;
+    let (depth_image, depth_memory, depth_view) = create_depth_image(ctx, extent)?;
 
     Ok(Swapchain {
         loader,
@@ -163,19 +120,9 @@ fn build(
         image_views,
         extent,
         format: fmt.format,
-        scene_color_image,
-        scene_color_memory,
-        scene_color_view,
         depth_image,
         depth_memory,
         depth_view,
-        depth_sample_view,
-        ao_image,
-        ao_memory,
-        ao_view,
-        ao_blurred_image,
-        ao_blurred_memory,
-        ao_blurred_view,
     })
 }
 
@@ -183,45 +130,10 @@ fn build(
 // Image helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn create_color_image(
-    ctx:    &VulkanContext,
-    extent: vk::Extent2D,
-    format: vk::Format,
-    usage:  vk::ImageUsageFlags,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
-    let image = unsafe {
-        ctx.device.create_image(&vk::ImageCreateInfo {
-            image_type:  vk::ImageType::TYPE_2D,
-            format,
-            extent: vk::Extent3D { width: extent.width, height: extent.height, depth: 1 },
-            mip_levels:   1,
-            array_layers: 1,
-            samples:      vk::SampleCountFlags::TYPE_1,
-            tiling:       vk::ImageTiling::OPTIMAL,
-            usage,
-            sharing_mode: vk::SharingMode::EXCLUSIVE,
-            ..Default::default()
-        }, None)?
-    };
-    let mem_reqs = unsafe { ctx.device.get_image_memory_requirements(image) };
-    let mem_type = ctx.find_memory_type(
-        mem_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-    let memory = unsafe {
-        ctx.device.allocate_memory(&vk::MemoryAllocateInfo {
-            allocation_size:   mem_reqs.size,
-            memory_type_index: mem_type,
-            ..Default::default()
-        }, None)?
-    };
-    unsafe { ctx.device.bind_image_memory(image, memory, 0)? };
-    let view = make_view(&ctx.device, image, format, vk::ImageAspectFlags::COLOR)?;
-    Ok((image, memory, view))
-}
-
 fn create_depth_image(
     ctx:    &VulkanContext,
     extent: vk::Extent2D,
-) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView, vk::ImageView)> {
+) -> Result<(vk::Image, vk::DeviceMemory, vk::ImageView)> {
     let format = vk::Format::D32_SFLOAT_S8_UINT;
     let image = unsafe {
         ctx.device.create_image(&vk::ImageCreateInfo {
@@ -232,8 +144,7 @@ fn create_depth_image(
             array_layers: 1,
             samples:      vk::SampleCountFlags::TYPE_1,
             tiling:       vk::ImageTiling::OPTIMAL,
-            usage:        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                        | vk::ImageUsageFlags::SAMPLED,
+            usage:        vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             ..Default::default()
         }, None)?
@@ -250,12 +161,10 @@ fn create_depth_image(
     };
     unsafe { ctx.device.bind_image_memory(image, memory, 0)? };
 
-    let depth_view = make_view(&ctx.device, image, format,
+    let view = make_view(&ctx.device, image, format,
         vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL)?;
-    let depth_sample_view = make_view(&ctx.device, image, format,
-        vk::ImageAspectFlags::DEPTH)?;
 
-    Ok((image, memory, depth_view, depth_sample_view))
+    Ok((image, memory, view))
 }
 
 fn make_view(
@@ -281,7 +190,7 @@ fn make_view(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Format / present-mode selection (unchanged from original)
+// Format / present-mode selection
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub fn choose_surface_format(formats: &[vk::SurfaceFormatKHR]) -> vk::Format {
