@@ -900,6 +900,52 @@ impl World {
         }
     }
 
+    /// Ensure block data exists in stored_chunks for every chunk that overlaps the player's XZ
+    /// footprint. Called once per frame before physics so is_solid never misses a visible chunk.
+    ///
+    /// A chunk may be fully rendered but have no stored block data if it was meshed before the
+    /// player was close (the raw data is discarded after meshing to save RAM). When that happens
+    /// we regenerate deterministically from the same noise seed — same result, no visible change.
+    pub fn prep_player_collision(&mut self, player_feet: Vec3) {
+        const HALF_W: f32 = 0.32; // slightly wider than physics HALF_W for a one-block margin
+        let corners = [
+            (player_feet.x - HALF_W, player_feet.z - HALF_W),
+            (player_feet.x + HALF_W, player_feet.z - HALF_W),
+            (player_feet.x - HALF_W, player_feet.z + HALF_W),
+            (player_feet.x + HALF_W, player_feet.z + HALF_W),
+        ];
+        let mut seen = [IVec2::ZERO; 4];
+        let mut n = 0usize;
+        for (x, z) in corners {
+            let cx = x.floor() as i32;
+            let cz = z.floor() as i32;
+            let coord = IVec2::new(cx.div_euclid(CHUNK_SIZE as i32), cz.div_euclid(CHUNK_SIZE as i32));
+            if seen[..n].contains(&coord) { continue; }
+            seen[n] = coord; n += 1;
+            if !self.stored_chunks.contains_key(&coord) && self.loaded.contains(&coord) {
+                let origin = IVec3::new(coord.x * CHUNK_SIZE as i32, 0, coord.y * CHUNK_SIZE as i32);
+                self.stored_chunks.insert(coord, generate(origin));
+            }
+        }
+    }
+
+    /// Returns true if the block at `pos` is solid (opaque). Treats out-of-world-bounds as solid
+    /// below y=0 and open above the world height. Unloaded chunks are treated as air — the
+    /// stored_chunks window (INTERACT_RADIUS around the player) always covers walking range.
+    pub fn is_solid(&self, pos: IVec3) -> bool {
+        if pos.y < 0 { return true; }
+        if pos.y >= CHUNK_HEIGHT as i32 { return false; }
+        let coord = IVec2::new(
+            pos.x.div_euclid(CHUNK_SIZE as i32),
+            pos.z.div_euclid(CHUNK_SIZE as i32),
+        );
+        let bx = pos.x.rem_euclid(CHUNK_SIZE as i32) as usize;
+        let bz = pos.z.rem_euclid(CHUNK_SIZE as i32) as usize;
+        self.stored_chunks
+            .get(&coord)
+            .map_or(false, |c| is_opaque(c.get(bx, pos.y as usize, bz)))
+    }
+
     /// Returns the arena vertex and index buffer handles.
     pub fn render_buffers(&self) -> Option<(vk::Buffer, vk::Buffer)> {
         match (&self.arena_vb, &self.arena_ib) {

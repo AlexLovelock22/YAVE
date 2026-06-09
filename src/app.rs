@@ -132,8 +132,14 @@ impl App {
                     if key == KeyCode::Escape && event.state == ElementState::Pressed {
                         self.set_cursor_grab(false);
                     }
+                    // CTRL toggles fly / walk mode.
+                    if key == KeyCode::ControlLeft && event.state == ElementState::Pressed {
+                        self.camera.flying = !self.camera.flying;
+                        // Zero velocity for a clean transition in either direction.
+                        self.camera.velocity = Vec3::ZERO;
+                    }
                     match event.state {
-                        ElementState::Pressed => { self.keys_held.insert(key); }
+                        ElementState::Pressed  => { self.keys_held.insert(key); }
                         ElementState::Released => { self.keys_held.remove(&key); }
                     }
                 }
@@ -191,7 +197,16 @@ impl App {
             }
         }
 
-        self.camera.apply_movement(&self.keys_held, dt);
+        // Ensure block data is cached for every chunk the player's feet overlap before physics.
+        // Chunks may be fully rendered but have no stored block data if they were meshed before
+        // the player was nearby (data is discarded after meshing to save RAM). Without this,
+        // is_solid returns false and the player falls through solid-looking terrain.
+        if !self.camera.flying {
+            let feet = self.camera.position - Vec3::new(0.0, 1.62, 0.0);
+            self.world.prep_player_collision(feet);
+        }
+
+        self.camera.apply_movement(&self.keys_held, dt, |pos| self.world.is_solid(pos));
 
         let t_update = Instant::now();
         self.world.update(self.camera.position, &self.renderer.ctx);
