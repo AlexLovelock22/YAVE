@@ -482,7 +482,7 @@ impl World {
             .copied().collect();
         for coord in remesh {
             self.pending_remesh.remove(&coord);
-            self.spawn_mesh(coord);
+            self.mesh_chunk_now(coord);
         }
 
         // ── Submit upload batch (one per frame max) ───────────────────────────
@@ -863,14 +863,40 @@ impl World {
 
     /// Schedule a fresh remesh for `coord`, keeping the old mesh visible until the new one lands.
     fn remesh_chunk(&mut self, coord: IVec2) {
-        // Discard any pending (not yet uploaded) mesh for this coord so only the new one uploads.
         self.upload_queue.retain(|c| *c != coord);
-        // cpu_meshes and chunk_allocs are intentionally kept — the old GPU mesh continues to
-        // render until submit_upload_batch replaces it, preventing any visual flicker.
         if self.mesh_in_flight.contains(&coord) {
+            // Rayon task already running — re-mesh once it finishes.
             self.pending_remesh.insert(coord);
         } else {
-            self.spawn_mesh(coord);
+            // Mesh synchronously so player edits don't wait behind terrain gen tasks.
+            self.mesh_chunk_now(coord);
+        }
+    }
+
+    /// Run all three LOD meshers on the main thread and push the result to the front of the
+    /// upload queue. Used for player edits so the mesh is ready before the next GPU batch,
+    /// regardless of how saturated the rayon pool is with background terrain work.
+    fn mesh_chunk_now(&mut self, coord: IVec2) {
+        let neighbors = build_neighbor_masks(coord, &self.face_data);
+        let stored = self.stored_chunks.get(&coord).cloned();
+        let chunk = if let Some(c) = stored {
+            self.pending_chunks.remove(&coord);
+            c
+        } else {
+            let origin = IVec3::new(coord.x * CHUNK_SIZE as i32, 0, coord.y * CHUNK_SIZE as i32);
+            self.pending_chunks.remove(&coord).unwrap_or_else(|| generate(origin))
+        };
+
+        let lod0 = mesh_chunk(&chunk, &neighbors);
+        let lod1 = mesh_chunk_surface(&chunk, &neighbors);
+        let lod2 = mesh_chunk_water(&chunk, &neighbors);
+
+        self.loaded.insert(coord);
+        self.upload_queue.retain(|c| *c != coord);
+        if !lod0.0.is_empty() {
+            self.cpu_meshes.insert(coord, [Arc::new(lod0), Arc::new(lod1), Arc::new(lod2)]);
+            // Insert at front so this chunk is in the very next upload batch.
+            self.upload_queue.insert(0, coord);
         }
     }
 
