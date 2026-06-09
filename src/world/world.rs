@@ -14,8 +14,8 @@ use crate::{
         mesh::{ArenaBuffer, ChunkSlot, IndirectBuffer, Vertex},
     },
     world::{
-        block::{DIRT, STONE, WATER},
-        chunk::{Chunk, CHUNK_SIZE},
+        block::{AIR, BlockId, DIRT, STONE, WATER, is_opaque},
+        chunk::{Chunk, CHUNK_SIZE, CHUNK_HEIGHT},
         continents::{build_defs, SEA_LEVEL},
         neighbor::{ChunkFaceData, NeighborMasks},
         terrain::sample_chunk_heights,
@@ -23,6 +23,10 @@ use crate::{
 };
 
 const DESTROY_LAG: usize = 3;
+/// Chebyshev chunk radius around the player where block data is kept in memory for interaction.
+const INTERACT_RADIUS: i32 = 3;
+/// Maximum raycast reach in blocks.
+const RAYCAST_REACH: f32 = 10.0;
 /// Max chunks uploaded per frame (bounds staging size and vkCopyBuffer count).
 const MAX_UPLOAD_BATCH: usize = 64;
 /// Persistent staging buffer sizes.
@@ -41,6 +45,9 @@ struct PendingBatch {
     cmd:   vk::CommandBuffer,
     /// Slots committed to chunk_allocs when the fence signals.
     slots: Vec<(IVec2, usize, ChunkSlot)>,
+    /// Old slots to defer-free once the fence signals (after new slots are committed).
+    /// Kept alive until then so the old GPU mesh stays visible with no 1-frame gap.
+    old_slots: Vec<ChunkSlot>,
 }
 
 pub struct World {
@@ -101,6 +108,14 @@ pub struct World {
     max_chunk_verts:   usize,
     total_chunk_verts: usize,
 
+    // ── Block interaction ─────────────────────────────────────────────────────
+    /// Full chunk block data for chunks within INTERACT_RADIUS + player-modified chunks.
+    stored_chunks:   HashMap<IVec2, Chunk>,
+    /// Tracks which chunks have player edits (never evicted from stored_chunks on distance).
+    modified_set:    HashSet<IVec2>,
+    /// Chunks needing remesh once their current in-flight mesh completes.
+    pending_remesh:  HashSet<IVec2>,
+
     // ── Diagnostics (written each update(), read by app for logging) ──────────
     pub diag_gen_rx_us:    u64,  // time spent draining gen channel
     pub diag_mesh_rx_us:   u64,  // time spent draining mesh channel
@@ -148,6 +163,9 @@ impl World {
             staging_vb_ptr: std::ptr::null_mut(),
             staging_ib_ptr: std::ptr::null_mut(),
             gen_rx, gen_tx, mesh_rx, mesh_tx,
+            stored_chunks:   HashMap::new(),
+            modified_set:    HashSet::new(),
+            pending_remesh:  HashSet::new(),
             frame_idx:         0,
             stats_timer:       Instant::now(),
             gen_spawned:       0,
@@ -256,10 +274,15 @@ impl World {
     fn spawn_mesh(&mut self, coord: IVec2) {
         let neighbors = build_neighbor_masks(coord, &self.face_data);
         let tx    = self.mesh_tx.clone();
-        let chunk = self.pending_chunks.remove(&coord).unwrap_or_else(|| {
+        // Prefer stored_chunks (has player edits), fall back to pending_chunks, then regenerate.
+        let stored = self.stored_chunks.get(&coord).cloned(); // release borrow before pending_chunks.remove
+        let chunk = if let Some(c) = stored {
+            self.pending_chunks.remove(&coord);
+            c
+        } else {
             let origin = IVec3::new(coord.x * CHUNK_SIZE as i32, 0, coord.y * CHUNK_SIZE as i32);
-            generate(origin)
-        });
+            self.pending_chunks.remove(&coord).unwrap_or_else(|| generate(origin))
+        };
         self.mesh_in_flight.insert(coord);
         rayon::spawn(move || {
             let t1 = Instant::now();
@@ -361,8 +384,13 @@ impl World {
                     ctx.device.free_command_buffers(pool, &[b.cmd]);
                     // Staging buffers are persistent — not freed here.
                 }
+                // Commit new slots first — GPU copy has completed, data is ready.
                 for (coord, lod, slot) in b.slots {
                     self.chunk_allocs.entry(coord).or_insert([None; 3])[lod] = Some(slot);
+                }
+                // Now safe to free old slots; new mesh is already live in chunk_allocs.
+                for old in b.old_slots {
+                    self.defer_free(old);
                 }
             }
         }
@@ -377,6 +405,12 @@ impl World {
             if (coord.x - cam_chunk.x).abs() > rd || (coord.y - cam_chunk.y).abs() > rd { continue; }
 
             self.face_data.insert(coord, fd);
+            // Cache block data for nearby chunks (needed for raycasting / block editing).
+            // Don't overwrite an existing stored_chunk — it might have player edits.
+            let interact = (coord.x - cam_chunk.x).abs().max((coord.y - cam_chunk.y).abs()) <= INTERACT_RADIUS;
+            if interact && !self.stored_chunks.contains_key(&coord) {
+                self.stored_chunks.insert(coord, chunk.clone());
+            }
             self.pending_chunks.insert(coord, chunk);
 
             if can_mesh(coord, &self.gen_in_flight) {
@@ -442,25 +476,13 @@ impl World {
         }
         self.diag_mesh_rx_us = t_mesh.elapsed().as_micros() as u64;
 
-        // ── Periodic stats ────────────────────────────────────────────────────
-        let settled = self.gen_in_flight.is_empty()
-            && self.spawn_queue.is_empty()
-            && self.pending_mesh.is_empty()
-            && self.mesh_in_flight.is_empty();
-        if !settled && self.stats_timer.elapsed().as_millis() >= 500 {
-            self.stats_timer = Instant::now();
-            let n = self.mesh_done.max(1) as u64;
-            println!(
-                "[chunks] gen {}/{}  mesh {}/{}  fly {} pend {} mfly {}  \
-                 avg_mesh {}us  max_verts {} avg_verts {}  queue {}",
-                self.gen_done, self.gen_spawned,
-                self.mesh_done, self.gen_spawned,
-                self.gen_in_flight.len(), self.pending_mesh.len(), self.mesh_in_flight.len(),
-                self.total_mesh_us / n,
-                self.max_chunk_verts,
-                self.total_chunk_verts / self.mesh_done.max(1) as usize,
-                self.upload_queue.len(),
-            );
+        // ── Pending remesh (block edits that arrived while mesh was in-flight) ─
+        let remesh: Vec<IVec2> = self.pending_remesh.iter()
+            .filter(|c| !self.mesh_in_flight.contains(c))
+            .copied().collect();
+        for coord in remesh {
+            self.pending_remesh.remove(&coord);
+            self.spawn_mesh(coord);
         }
 
         // ── Submit upload batch (one per frame max) ───────────────────────────
@@ -498,6 +520,11 @@ impl World {
             self.face_data.retain(|c, _| (c.x - cam_chunk.x).abs() <= rd + 2 && (c.y - cam_chunk.y).abs() <= rd + 2);
             self.pending_mesh.retain(|c| (c.x - cam_chunk.x).abs() <= rd && (c.y - cam_chunk.y).abs() <= rd);
             self.pending_chunks.retain(|c, _| self.pending_mesh.contains(c));
+            // Evict cached block data for chunks beyond the interact radius (keep modified chunks).
+            self.stored_chunks.retain(|c, _| {
+                self.modified_set.contains(c)
+                    || ((c.x - cam_chunk.x).abs().max((c.y - cam_chunk.y).abs()) <= INTERACT_RADIUS)
+            });
             self.gen_in_flight.retain(|c| (c.x - cam_chunk.x).abs() <= rd + 2 && (c.y - cam_chunk.y).abs() <= rd + 2);
             self.spawn_queue.retain(|c| (c.x - cam_chunk.x).abs() <= rd + 2 && (c.y - cam_chunk.y).abs() <= rd + 2);
             self.mesh_in_flight.retain(|c| (c.x - cam_chunk.x).abs() <= rd + 2 && (c.y - cam_chunk.y).abs() <= rd + 2);
@@ -570,6 +597,7 @@ impl World {
             coord:       IVec2,
             lod:         usize,
             slot:        ChunkSlot,
+            old_slot:    Option<ChunkSlot>, // previous alloc, freed when fence signals
             vb_stage:    usize, // byte offset in the staging VB
             ib_stage:    usize, // byte offset in the staging IB
         }
@@ -593,11 +621,10 @@ impl World {
                 let vb_size = verts.len() * size_of::<Vertex>();
                 let ib_size = idxs.len()  * size_of::<u32>();
 
-                // Defer-free any previously uploaded slot for this chunk/LOD.
-                if let Some(old) = self.chunk_allocs.get(coord).and_then(|a| a[lod]) {
-                    self.defer_free(old);
-                    self.chunk_allocs.entry(*coord).and_modify(|a| a[lod] = None);
-                }
+                // Capture the old slot — but do NOT nullify chunk_allocs yet.
+                // The old GPU mesh stays visible until the fence signals and the new
+                // slot is committed, preventing the 1-frame invisible gap.
+                let old_slot = self.chunk_allocs.get(coord).and_then(|a| a[lod]);
 
                 let vb_off = match self.alloc_vb(vb_size, ctx, pool) {
                     Some(o) => o,
@@ -612,7 +639,7 @@ impl World {
                 };
 
                 entries.push(Entry {
-                    coord: *coord, lod,
+                    coord: *coord, lod, old_slot,
                     slot: ChunkSlot {
                         vb_offset:   vb_off,  vb_size,
                         ib_offset:   ib_off,  ib_size,
@@ -717,8 +744,134 @@ impl World {
             }], fence).expect("submit batch");
         }
 
+        let old_slots: Vec<ChunkSlot> = entries.iter().filter_map(|e| e.old_slot).collect();
         let slots = entries.into_iter().map(|e| (e.coord, e.lod, e.slot)).collect();
-        self.pending_batch = Some(PendingBatch { fence, cmd, slots });
+        self.pending_batch = Some(PendingBatch { fence, cmd, slots, old_slots });
+    }
+
+    // ── Block interaction ─────────────────────────────────────────────────────
+
+    /// DDA raycast from `origin` along `dir`. Returns `(hit_block_pos, face_normal)` or `None`.
+    pub fn raycast(&self, origin: Vec3, dir: Vec3) -> Option<(IVec3, IVec3)> {
+        let dir = dir.normalize();
+        let step = IVec3::new(
+            if dir.x >= 0.0 { 1 } else { -1 },
+            if dir.y >= 0.0 { 1 } else { -1 },
+            if dir.z >= 0.0 { 1 } else { -1 },
+        );
+        let t_delta = Vec3::new(
+            if dir.x.abs() > 1e-10 { 1.0 / dir.x.abs() } else { f32::INFINITY },
+            if dir.y.abs() > 1e-10 { 1.0 / dir.y.abs() } else { f32::INFINITY },
+            if dir.z.abs() > 1e-10 { 1.0 / dir.z.abs() } else { f32::INFINITY },
+        );
+        let mut block = IVec3::new(origin.x.floor() as i32, origin.y.floor() as i32, origin.z.floor() as i32);
+        let mut t_max = Vec3::new(
+            if dir.x >= 0.0 { (block.x as f32 + 1.0 - origin.x) * t_delta.x } else { (origin.x - block.x as f32) * t_delta.x },
+            if dir.y >= 0.0 { (block.y as f32 + 1.0 - origin.y) * t_delta.y } else { (origin.y - block.y as f32) * t_delta.y },
+            if dir.z >= 0.0 { (block.z as f32 + 1.0 - origin.z) * t_delta.z } else { (origin.z - block.z as f32) * t_delta.z },
+        );
+        let mut last_normal = IVec3::ZERO;
+        let mut cached: Option<(IVec2, Chunk)> = None;
+
+        loop {
+            if block.y >= 0 && block.y < CHUNK_HEIGHT as i32 {
+                let coord = IVec2::new(block.x.div_euclid(CHUNK_SIZE as i32), block.z.div_euclid(CHUNK_SIZE as i32));
+                let bx = block.x.rem_euclid(CHUNK_SIZE as i32) as usize;
+                let by = block.y as usize;
+                let bz = block.z.rem_euclid(CHUNK_SIZE as i32) as usize;
+
+                let id = match self.stored_chunks.get(&coord) {
+                    Some(c) => c.get(bx, by, bz),
+                    None => match &cached {
+                        Some((cc, c)) if *cc == coord => c.get(bx, by, bz),
+                        _ => {
+                            let o = IVec3::new(coord.x * CHUNK_SIZE as i32, 0, coord.y * CHUNK_SIZE as i32);
+                            let c = generate(o);
+                            let id = c.get(bx, by, bz);
+                            cached = Some((coord, c));
+                            id
+                        }
+                    },
+                };
+
+                if is_opaque(id) {
+                    return Some((block, last_normal));
+                }
+            }
+
+            // Advance to next block face
+            if t_max.x <= t_max.y && t_max.x <= t_max.z {
+                if t_max.x > RAYCAST_REACH { return None; }
+                block.x += step.x;
+                last_normal = IVec3::new(-step.x, 0, 0);
+                t_max.x += t_delta.x;
+            } else if t_max.y <= t_max.z {
+                if t_max.y > RAYCAST_REACH { return None; }
+                block.y += step.y;
+                last_normal = IVec3::new(0, -step.y, 0);
+                t_max.y += t_delta.y;
+            } else {
+                if t_max.z > RAYCAST_REACH { return None; }
+                block.z += step.z;
+                last_normal = IVec3::new(0, 0, -step.z);
+                t_max.z += t_delta.z;
+            }
+        }
+    }
+
+    /// Place or remove a block at the given world position and schedule a remesh.
+    pub fn set_block(&mut self, world_pos: IVec3, id: BlockId) {
+        if world_pos.y < 0 || world_pos.y >= CHUNK_HEIGHT as i32 { return; }
+        let coord = IVec2::new(
+            world_pos.x.div_euclid(CHUNK_SIZE as i32),
+            world_pos.z.div_euclid(CHUNK_SIZE as i32),
+        );
+        let lx = world_pos.x.rem_euclid(CHUNK_SIZE as i32) as usize;
+        let ly = world_pos.y as usize;
+        let lz = world_pos.z.rem_euclid(CHUNK_SIZE as i32) as usize;
+
+        // Ensure the chunk is stored (generate if not yet cached).
+        if !self.stored_chunks.contains_key(&coord) {
+            let origin = IVec3::new(coord.x * CHUNK_SIZE as i32, 0, coord.y * CHUNK_SIZE as i32);
+            self.stored_chunks.insert(coord, generate(origin));
+        }
+
+        self.stored_chunks.get_mut(&coord).unwrap().set(lx, ly, lz, id);
+        self.modified_set.insert(coord);
+
+        // Refresh face data for this chunk (needed for neighbour AO/culling).
+        let fd = ChunkFaceData::extract(self.stored_chunks.get(&coord).unwrap());
+        self.face_data.insert(coord, fd);
+
+        self.remesh_chunk(coord);
+
+        // If the modified block is on a chunk border, also remesh the adjacent chunk.
+        let dirs: &[(bool, IVec2)] = &[
+            (lx == 0,              IVec2::new(-1,  0)),
+            (lx == CHUNK_SIZE - 1, IVec2::new( 1,  0)),
+            (lz == 0,              IVec2::new( 0, -1)),
+            (lz == CHUNK_SIZE - 1, IVec2::new( 0,  1)),
+        ];
+        for &(on_border, d) in dirs {
+            if !on_border { continue; }
+            let nb = coord + d;
+            if self.face_data.contains_key(&nb) {
+                self.remesh_chunk(nb);
+            }
+        }
+    }
+
+    /// Schedule a fresh remesh for `coord`, keeping the old mesh visible until the new one lands.
+    fn remesh_chunk(&mut self, coord: IVec2) {
+        // Discard any pending (not yet uploaded) mesh for this coord so only the new one uploads.
+        self.upload_queue.retain(|c| *c != coord);
+        // cpu_meshes and chunk_allocs are intentionally kept — the old GPU mesh continues to
+        // render until submit_upload_batch replaces it, preventing any visual flicker.
+        if self.mesh_in_flight.contains(&coord) {
+            self.pending_remesh.insert(coord);
+        } else {
+            self.spawn_mesh(coord);
+        }
     }
 
     /// Returns the arena vertex and index buffer handles.

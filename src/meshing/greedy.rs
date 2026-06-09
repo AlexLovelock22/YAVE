@@ -355,7 +355,6 @@ pub fn mesh_chunk(chunk: &Chunk, neighbors: &NeighborMasks) -> (Vec<Vertex>, Vec
                 for v in 0..v_len {
                     let (x, y, z) = to_xyz(dir, d, u, v);
                     let id = chunk.get(x, y, z);
-                    if dir == FaceDir::NegY { continue; }
                     let Some(model) = get_model(id) else { continue };
                     if id == WATER { continue; }
                     let Some(face) = model.face(dir) else { continue };

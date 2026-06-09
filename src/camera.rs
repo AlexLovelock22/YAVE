@@ -24,7 +24,7 @@ impl Camera {
         }
     }
 
-    fn forward(&self) -> Vec3 {
+    pub fn forward(&self) -> Vec3 {
         Vec3::new(
             self.pitch.cos() * self.yaw.sin(),
             self.pitch.sin(),

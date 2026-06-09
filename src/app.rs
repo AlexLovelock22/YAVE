@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use winit::{
-    event::{DeviceEvent, ElementState, MouseScrollDelta, WindowEvent},
+    event::{DeviceEvent, ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     keyboard::{KeyCode, PhysicalKey},
     window::{CursorGrabMode, Window},
 };
@@ -15,7 +15,7 @@ use crate::{
     camera::Camera,
     render::{mesh::PushConstants, renderer::Renderer},
     settings,
-    world::world::World,
+    world::{block::{AIR, STONE}, world::World},
 };
 
 pub struct App {
@@ -95,9 +95,25 @@ impl App {
                     let _ = self.renderer.resize(size.width, size.height);
                 }
             }
-            // Any click grabs the cursor; Escape releases it
-            WindowEvent::MouseInput { state: ElementState::Pressed, .. } => {
-                self.set_cursor_grab(true);
+            // First click grabs the cursor. While grabbed: left=mine, right=place stone.
+            WindowEvent::MouseInput { state: ElementState::Pressed, button, .. } => {
+                if !self.cursor_grabbed {
+                    self.set_cursor_grab(true);
+                } else {
+                    match button {
+                        MouseButton::Left => {
+                            if let Some((hit, _)) = self.world.raycast(self.camera.position, self.camera.forward()) {
+                                self.world.set_block(hit, AIR);
+                            }
+                        }
+                        MouseButton::Right => {
+                            if let Some((hit, normal)) = self.world.raycast(self.camera.position, self.camera.forward()) {
+                                self.world.set_block(hit + normal, STONE);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             }
             WindowEvent::Focused(false) => {
                 self.set_cursor_grab(false);

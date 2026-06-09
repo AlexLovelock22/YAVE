@@ -6,6 +6,7 @@ pub const CHUNK_SIZE: usize = 32;
 pub const CHUNK_HEIGHT: usize = 256;
 
 /// Flat array storage: index = x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE
+#[derive(Clone)]
 pub struct Chunk {
     pub origin: IVec3,
     pub dirty: bool,
