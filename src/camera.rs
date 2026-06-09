@@ -11,8 +11,6 @@ const HALF_W:     f32 = 0.3;   // half-width of player AABB
 const PLAYER_H:   f32 = 1.8;   // full height of player AABB
 const WALK_ACCEL: f32 = 60.0;
 const WALK_DECEL: f32 = 40.0;
-const FLY_ACCEL:  f32 = 50.0;
-const FLY_DECEL:  f32 = 35.0;
 
 pub struct Camera {
     pub position:  Vec3,
@@ -34,7 +32,7 @@ impl Camera {
             pitch:     -0.3,
             fov_y:     90_f32.to_radians(),
             aspect,
-            speed:     20.0,
+            speed:     200.0,
             velocity:  Vec3::ZERO,
             on_ground: false,
             flying:    true,
@@ -102,11 +100,13 @@ impl Camera {
     }
 
     fn apply_fly(&mut self, keys: &HashSet<KeyCode>, dt: f32) {
-        let forward = self.forward();
-        let right   = self.right();
+        // Horizontal movement uses yaw only — looking up/down doesn't pull you
+        // vertically when pressing W/S.
+        let fwd   = Vec3::new(self.yaw.sin(), 0.0, self.yaw.cos());
+        let right = Vec3::new(self.yaw.cos(), 0.0, -self.yaw.sin());
         let mut wish = Vec3::ZERO;
-        if keys.contains(&KeyCode::KeyW) { wish += forward; }
-        if keys.contains(&KeyCode::KeyS) { wish -= forward; }
+        if keys.contains(&KeyCode::KeyW) { wish += fwd; }
+        if keys.contains(&KeyCode::KeyS) { wish -= fwd; }
         if keys.contains(&KeyCode::KeyA) { wish += right; }
         if keys.contains(&KeyCode::KeyD) { wish -= right; }
         if keys.contains(&KeyCode::Space) { wish.y += 1.0; }
@@ -114,11 +114,12 @@ impl Camera {
             wish.y -= 1.0;
         }
 
-        let target = if wish.length_squared() > 0.0 { wish.normalize() * self.speed } else { Vec3::ZERO };
-        let accel  = if wish.length_squared() > 0.0 { FLY_ACCEL } else { FLY_DECEL };
-        self.velocity.x = nudge(self.velocity.x, target.x, accel * dt);
-        self.velocity.y = nudge(self.velocity.y, target.y, accel * dt);
-        self.velocity.z = nudge(self.velocity.z, target.z, accel * dt);
+        // No inertia: instant full speed, instant stop.
+        self.velocity = if wish.length_squared() > 0.0 {
+            wish.normalize() * self.speed
+        } else {
+            Vec3::ZERO
+        };
 
         self.position += self.velocity * dt;
     }
