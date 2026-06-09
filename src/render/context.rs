@@ -87,11 +87,17 @@ impl VulkanContext {
             .collect();
 
         let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
+        let phys_features = unsafe { instance.get_physical_device_features(physical_device) };
+        let enabled_features = vk::PhysicalDeviceFeatures {
+            wide_lines: phys_features.wide_lines,
+            ..Default::default()
+        };
         let device_info = vk::DeviceCreateInfo {
             queue_create_info_count: queue_infos.len() as u32,
             p_queue_create_infos: queue_infos.as_ptr(),
             enabled_extension_count: device_extensions.len() as u32,
             pp_enabled_extension_names: device_extensions.as_ptr(),
+            p_enabled_features: &enabled_features,
             ..Default::default()
         };
 

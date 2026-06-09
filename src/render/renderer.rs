@@ -1,6 +1,7 @@
 use anyhow::Result;
 use ash::vk;
 use bytemuck::bytes_of;
+use glam::Vec3;
 
 use super::{
     context::VulkanContext,
@@ -30,6 +31,19 @@ pub struct Renderer {
     in_flight:       Vec<vk::Fence>,
     render_finished: Vec<vk::Semaphore>,
     current_frame:   usize,
+
+    // ── Block target outline (small HOST_VISIBLE buffers) ─────────────────────
+    outline_vb:     vk::Buffer,
+    outline_vb_mem: vk::DeviceMemory,
+    outline_vb_ptr: *mut u8,
+    outline_ib:     vk::Buffer,
+    outline_ib_mem: vk::DeviceMemory,
+
+    // ── Screen-space crosshair (static HOST_VISIBLE buffers) ─────────────────
+    crosshair_vb:     vk::Buffer,
+    crosshair_vb_mem: vk::DeviceMemory,
+    crosshair_ib:     vk::Buffer,
+    crosshair_ib_mem: vk::DeviceMemory,
 }
 
 impl Renderer {
@@ -79,6 +93,52 @@ impl Renderer {
             .map(|_| unsafe { ctx.device.create_semaphore(&sem_info, None).map_err(Into::into) })
             .collect::<Result<Vec<_>>>()?;
 
+        // Outline: 8 vertices × 12 bytes = 96 bytes VB; 24 indices × 4 bytes = 96 bytes IB.
+        let (outline_vb, outline_vb_mem, outline_vb_ptr) =
+            alloc_host_buffer(&ctx, 96, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+        let (outline_ib, outline_ib_mem, outline_ib_ptr) =
+            alloc_host_buffer(&ctx, 96, vk::BufferUsageFlags::INDEX_BUFFER)?;
+        // Write constant edge indices once.
+        let outline_indices: [u32; 24] = [
+            0,1, 1,2, 2,3, 3,0,  // bottom face
+            4,5, 5,6, 6,7, 7,4,  // top face
+            0,4, 1,5, 2,6, 3,7,  // vertical edges
+        ];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                outline_indices.as_ptr() as *const u8,
+                outline_ib_ptr,
+                96,
+            );
+        }
+
+        // Crosshair: 8 vertices × 8 bytes (vec2) = 64 bytes VB; 12 indices × 4 bytes = 48 bytes IB.
+        // arm_len and bar_thick are in square-NDC-y units; vertex shader divides x by aspect.
+        const ARM: f32 = 0.04;
+        const THK: f32 = 0.003;
+        let crosshair_verts: [[f32; 2]; 8] = [
+            [-ARM, -THK], [ ARM, -THK], [ ARM,  THK], [-ARM,  THK],  // horizontal bar
+            [-THK, -ARM], [ THK, -ARM], [ THK,  ARM], [-THK,  ARM],  // vertical bar
+        ];
+        let crosshair_indices: [u32; 12] = [0,1,2, 0,2,3, 4,5,6, 4,6,7];
+
+        let (crosshair_vb, crosshair_vb_mem, crosshair_vb_ptr) =
+            alloc_host_buffer(&ctx, 64, vk::BufferUsageFlags::VERTEX_BUFFER)?;
+        let (crosshair_ib, crosshair_ib_mem, crosshair_ib_ptr) =
+            alloc_host_buffer(&ctx, 48, vk::BufferUsageFlags::INDEX_BUFFER)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                crosshair_verts.as_ptr() as *const u8,
+                crosshair_vb_ptr,
+                64,
+            );
+            std::ptr::copy_nonoverlapping(
+                crosshair_indices.as_ptr() as *const u8,
+                crosshair_ib_ptr,
+                48,
+            );
+        }
+
         Ok(Self {
             ctx,
             swapchain,
@@ -91,6 +151,15 @@ impl Renderer {
             in_flight,
             render_finished,
             current_frame: 0,
+            outline_vb,
+            outline_vb_mem,
+            outline_vb_ptr,
+            outline_ib,
+            outline_ib_mem,
+            crosshair_vb,
+            crosshair_vb_mem,
+            crosshair_ib,
+            crosshair_ib_mem,
         })
     }
 
@@ -126,11 +195,37 @@ impl Renderer {
         indirect:       Option<(vk::Buffer, u32)>,
         water_indirect: Option<(vk::Buffer, u32)>,
         push:           PushConstants,
+        outline_pos:    Option<Vec3>,
+        aspect:         f32,
     ) -> Result<()> {
         let cmd = self.command_buffers[self.current_frame];
         unsafe {
             self.ctx.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?
         };
+
+        // Update outline vertex buffer with the 8 expanded cube corners.
+        if let Some(p) = outline_pos {
+            let e = 0.005_f32;
+            let corners: [[f32; 3]; 8] = [
+                [p.x - e,       p.y - e,       p.z - e      ],
+                [p.x + 1.0 + e, p.y - e,       p.z - e      ],
+                [p.x + 1.0 + e, p.y + 1.0 + e, p.z - e      ],
+                [p.x - e,       p.y + 1.0 + e, p.z - e      ],
+                [p.x - e,       p.y - e,       p.z + 1.0 + e],
+                [p.x + 1.0 + e, p.y - e,       p.z + 1.0 + e],
+                [p.x + 1.0 + e, p.y + 1.0 + e, p.z + 1.0 + e],
+                [p.x - e,       p.y + 1.0 + e, p.z + 1.0 + e],
+            ];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    corners.as_ptr() as *const u8,
+                    self.outline_vb_ptr,
+                    96,
+                );
+            }
+        }
+
+        let outline_bufs = outline_pos.map(|_| (self.outline_vb, self.outline_ib));
 
         record(
             &self.ctx,
@@ -143,6 +238,9 @@ impl Renderer {
             water_indirect,
             push,
             self.texture.desc_set,
+            outline_bufs,
+            (self.crosshair_vb, self.crosshair_ib),
+            aspect,
         )?;
 
         let wait_semaphores   = [self.image_available[self.current_frame]];
@@ -214,8 +312,50 @@ impl Drop for Renderer {
             pipeline::destroy(&self.ctx, &self.pipeline);
             self.texture.destroy(&self.ctx);
             self.ctx.device.destroy_command_pool(self.command_pool, None);
+            self.ctx.device.destroy_buffer(self.outline_vb, None);
+            self.ctx.device.free_memory(self.outline_vb_mem, None);
+            self.ctx.device.destroy_buffer(self.outline_ib, None);
+            self.ctx.device.free_memory(self.outline_ib_mem, None);
+            self.ctx.device.destroy_buffer(self.crosshair_vb, None);
+            self.ctx.device.free_memory(self.crosshair_vb_mem, None);
+            self.ctx.device.destroy_buffer(self.crosshair_ib, None);
+            self.ctx.device.free_memory(self.crosshair_ib_mem, None);
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Host-visible buffer allocation
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn alloc_host_buffer(
+    ctx:   &VulkanContext,
+    size:  u64,
+    usage: vk::BufferUsageFlags,
+) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8)> {
+    let buf_info = vk::BufferCreateInfo {
+        size,
+        usage,
+        sharing_mode: vk::SharingMode::EXCLUSIVE,
+        ..Default::default()
+    };
+    let buf = unsafe { ctx.device.create_buffer(&buf_info, None)? };
+    let reqs = unsafe { ctx.device.get_buffer_memory_requirements(buf) };
+    let mem_type = ctx.find_memory_type(
+        reqs.memory_type_bits,
+        vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+    )?;
+    let alloc = vk::MemoryAllocateInfo {
+        allocation_size:   reqs.size,
+        memory_type_index: mem_type,
+        ..Default::default()
+    };
+    let mem = unsafe { ctx.device.allocate_memory(&alloc, None)? };
+    unsafe { ctx.device.bind_buffer_memory(buf, mem, 0)? };
+    let ptr = unsafe {
+        ctx.device.map_memory(mem, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?
+    } as *mut u8;
+    Ok((buf, mem, ptr))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -265,6 +405,9 @@ fn record(
     water_indirect: Option<(vk::Buffer, u32)>,
     push:           PushConstants,
     tex_set:        vk::DescriptorSet,
+    outline:        Option<(vk::Buffer, vk::Buffer)>,
+    crosshair:      (vk::Buffer, vk::Buffer),
+    aspect:         f32,
 ) -> Result<()> {
     let d  = &ctx.device;
     let ex = sc.extent;
@@ -329,6 +472,38 @@ fn record(
                 }
             }
         }
+        // Draw block target outline last (depth-test on, no depth write).
+        if let Some((ovb, oib)) = outline {
+            d.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::HOST,
+                vk::PipelineStageFlags::VERTEX_INPUT,
+                vk::DependencyFlags::empty(),
+                &[vk::MemoryBarrier {
+                    src_access_mask: vk::AccessFlags::HOST_WRITE,
+                    dst_access_mask: vk::AccessFlags::VERTEX_ATTRIBUTE_READ
+                        | vk::AccessFlags::INDEX_READ,
+                    ..Default::default()
+                }],
+                &[], &[],
+            );
+            d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.outline_pipeline);
+            d.cmd_push_constants(cmd, pipeline.outline_layout, vk::ShaderStageFlags::VERTEX,
+                0, bytes_of(&push));
+            d.cmd_bind_vertex_buffers(cmd, 0, &[ovb], &[0]);
+            d.cmd_bind_index_buffer(cmd, oib, 0, vk::IndexType::UINT32);
+            d.cmd_draw_indexed(cmd, 24, 1, 0, 0, 0);
+        }
+
+        // Crosshair: always-visible inversion-blend + at screen center.
+        let (cvb, cib) = crosshair;
+        d.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline.crosshair_pipeline);
+        d.cmd_push_constants(cmd, pipeline.crosshair_layout, vk::ShaderStageFlags::VERTEX,
+            0, &aspect.to_le_bytes());
+        d.cmd_bind_vertex_buffers(cmd, 0, &[cvb], &[0]);
+        d.cmd_bind_index_buffer(cmd, cib, 0, vk::IndexType::UINT32);
+        d.cmd_draw_indexed(cmd, 12, 1, 0, 0, 0);
+
         d.cmd_end_render_pass(cmd);
     }
 

@@ -11,6 +11,8 @@ use winit::{
 
 use ash::vk;
 
+use glam::Vec3;
+
 use crate::{
     camera::Camera,
     render::{mesh::PushConstants, renderer::Renderer},
@@ -223,7 +225,15 @@ impl App {
         }
 
         let push = PushConstants { mvp: self.camera.view_proj().to_cols_array_2d() };
-        let r = self.renderer.end_frame(image_index, self.world.render_buffers(), self.world.indirect_draw(), self.world.indirect_draw_water(), push);
+
+        let outline_pos = if self.cursor_grabbed {
+            self.world.raycast(self.camera.position, self.camera.forward())
+                .map(|(hit, _)| Vec3::new(hit.x as f32, hit.y as f32, hit.z as f32))
+        } else {
+            None
+        };
+
+        let r = self.renderer.end_frame(image_index, self.world.render_buffers(), self.world.indirect_draw(), self.world.indirect_draw_water(), push, outline_pos, self.camera.aspect);
         let gpu_us = t_gpu.elapsed().as_micros() as u64;
 
         let total_us = update_us + cull_us + gpu_us;

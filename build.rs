@@ -3,8 +3,12 @@ use std::process::Command;
 
 fn main() {
     let shaders = [
-        ("shaders/voxel.vert", "voxel.vert.spv"),
-        ("shaders/voxel.frag", "voxel.frag.spv"),
+        ("shaders/voxel.vert",   "voxel.vert.spv"),
+        ("shaders/voxel.frag",   "voxel.frag.spv"),
+        ("shaders/outline.vert",    "outline.vert.spv"),
+        ("shaders/outline.frag",    "outline.frag.spv"),
+        ("shaders/crosshair.vert",  "crosshair.vert.spv"),
+        ("shaders/crosshair.frag",  "crosshair.frag.spv"),
     ];
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

@@ -1,2 +1,6 @@
 cargo:rerun-if-changed=shaders/voxel.vert
 cargo:rerun-if-changed=shaders/voxel.frag
+cargo:rerun-if-changed=shaders/outline.vert
+cargo:rerun-if-changed=shaders/outline.frag
+cargo:rerun-if-changed=shaders/crosshair.vert
+cargo:rerun-if-changed=shaders/crosshair.frag
