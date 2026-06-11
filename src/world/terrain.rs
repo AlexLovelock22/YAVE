@@ -21,19 +21,16 @@ const GRID_DIM:    usize = CHUNK_SIZE / GRID_STRIDE + 1; // 9
 
 // ── Noise frequencies ─────────────────────────────────────────────────────────
 
-// Terrain shape uses 3-octave FBM so features are consistently distributed at
-// every scale.  Two-octave systems produce "beating" — alternating smooth/lumpy
-// patches wherever the two frequencies constructively or destructively interfere.
+// Single-octave terrain noise: one smooth frequency, consistent character everywhere.
+// Multi-octave FBM was producing two visually distinct areas (smooth vs scarified)
+// because octaves cancel/add gradients differently across space.  A single octave
+// avoids that entirely — the terrain looks the same style in every region.
 //
-//   octave 0: freq 1/1600, amplitude 0.500  (broad hills / valleys)
-//   octave 1: freq 1/ 800, amplitude 0.250  (medium rolling)
-//   octave 2: freq 1/ 400, amplitude 0.125  (local texture)
-//   max |sum| = 0.875  → normalise by dividing
-const TERRAIN_BASE_FREQ:  f32 = 1.0 / 1_600.0;
-const TERRAIN_LACUNARITY: f32 = 2.0;   // frequency multiplier per octave
-const TERRAIN_PERSISTENCE:f32 = 0.5;   // amplitude multiplier per octave
-const TERRAIN_OCTAVES:    u32 = 3;
-// Per-octave Z seed offsets so octaves are uncorrelated
+//   octave 0: freq 1/1400, amplitude 1.0 (after normalisation)
+const TERRAIN_BASE_FREQ:  f32 = 1.0 / 4_000.0;
+const TERRAIN_LACUNARITY: f32 = 2.0;   // unused with one octave, kept for easy expansion
+const TERRAIN_PERSISTENCE:f32 = 0.5;   // unused with one octave, kept for easy expansion
+const TERRAIN_OCTAVES:    u32 = 1;
 const TERRAIN_SEEDS: [f32; 3] = [0.0, 37.1, 71.3];
 
 const NOISE_FREQ_HARD: f32 = 1.0 / 900.0;  // rock-hardness patches
@@ -128,7 +125,6 @@ pub fn sample_chunk_heights(
 ) -> usize {
     let mut c_grid      = [0.0f32; GRID_DIM * GRID_DIM];
     let mut noise_grid  = [0.0f32; GRID_DIM * GRID_DIM];
-    let mut hard_grid   = [0.0f32; GRID_DIM * GRID_DIM];
     let mut inland_grid = [0.0f32; GRID_DIM * GRID_DIM];
 
     for gz in 0..GRID_DIM {
@@ -140,11 +136,6 @@ pub fn sample_chunk_heights(
 
             c_grid[gi]      = continentalness_defs(defs, fx, fz);
             noise_grid[gi]  = terrain_noise(fx, fz);
-            hard_grid[gi]   = simplex2d(fx * NOISE_FREQ_HARD + 53.1,
-                                        fz * NOISE_FREQ_HARD + 71.7);
-            // Island filter: minimum continentalness found in 4 cardinal directions.
-            // Stored per grid point and bilinearly interpolated so adjacent chunks
-            // agree on boundary values and there are no seams.
             inland_grid[gi] = inland_depth(defs, fx, fz);
         }
     }
@@ -162,11 +153,10 @@ pub fn sample_chunk_heights(
 
             let c        = bilerp(&c_grid,      gx0, gz0, gx1, gz1, tx, tz);
             let noise_01 = bilerp(&noise_grid,  gx0, gz0, gx1, gz1, tx, tz) * 0.5 + 0.5;
-            let hardness = bilerp(&hard_grid,   gx0, gz0, gx1, gz1, tx, tz) * 0.5 + 0.5;
             let inland   = bilerp(&inland_grid, gx0, gz0, gx1, gz1, tx, tz);
 
             let idx = x + z * CHUNK_SIZE;
-            let (sy, ocean) = surface_from_cv(c, noise_01, hardness, inland);
+            let (sy, ocean) = surface_from_cv(c, noise_01, inland);
             out_surface[idx] = sy as u16;
             out_ocean[idx]   = ocean;
             if !ocean && sy > max_y { max_y = sy; }
@@ -180,10 +170,8 @@ pub fn sample_column(defs: &[ContinentDef; 9], wx: i32, wz: i32) -> TerrainColum
     let (fx, fz) = (wx as f32, wz as f32);
     let c        = continentalness_defs(defs, fx, fz);
     let noise_01 = terrain_noise(fx, fz) * 0.5 + 0.5;
-    let hardness = simplex2d(fx * NOISE_FREQ_HARD + 53.1,
-                             fz * NOISE_FREQ_HARD + 71.7) * 0.5 + 0.5;
     let inl      = inland_depth(defs, fx, fz);
-    let (surface_y, is_ocean) = surface_from_cv(c, noise_01, hardness, inl);
+    let (surface_y, is_ocean) = surface_from_cv(c, noise_01, inl);
     TerrainColumn { surface_y, is_ocean }
 }
 
@@ -199,24 +187,20 @@ fn terrain_noise(fx: f32, fz: f32) -> f32 {
         amp  *= TERRAIN_PERSISTENCE;
         freq *= TERRAIN_LACUNARITY;
     }
-    // max |val| = 0.5 + 0.25 + 0.125 = 0.875; normalise to [-1, 1]
-    (val / 0.875).clamp(-1.0, 1.0)
+    // single octave: max |val| = TERRAIN_PERSISTENCE = 0.5; normalise to [-1, 1]
+    (val / TERRAIN_PERSISTENCE).clamp(-1.0, 1.0)
 }
 
-fn surface_from_cv(c: f32, noise_01: f32, hardness: f32, inland: f32) -> (usize, bool) {
+fn surface_from_cv(c: f32, noise_01: f32, inland: f32) -> (usize, bool) {
     let ocean_h = lerp(OCEAN_FLOOR_MIN, OCEAN_FLOOR_MAX, noise_01);
     let land_h  = lerp(LAND_HEIGHT_MIN, LAND_HEIGHT_MAX, noise_01);
 
-    // Base height: unchanged original blend.
     let cf      = cont_factor(c);
     let base_sy = lerp(ocean_h, land_h, cf);
 
-    // ── Coastal cliff boost ───────────────────────────────────────────────────
-    //
-    // coast_strip: 1 at the visible waterline, 0 beyond CLIFF_COASTAL_WINDOW blocks
-    // above sea level.  Keying on actual height-above-sea keeps the boost aligned
-    // with where water meets land rather than with the c=0 continentalness boundary
-    // (which can be noticeably inland for tall-terrain coasts).
+    // Coastal cliff boost: peaks at the waterline, fades to zero at CLIFF_COASTAL_WINDOW
+    // blocks above sea level.  Only depends on smooth fields (noise_01, coast_strip,
+    // land_size_cond) — no hardness noise, so the approach zone is uniformly smooth.
     let height_above_sea = base_sy - SEA_LEVEL as f32;
     let coast_strip = if height_above_sea > 0.0 {
         smoothstep(CLIFF_COASTAL_WINDOW, 0.0, height_above_sea)
@@ -224,43 +208,12 @@ fn surface_from_cv(c: f32, noise_01: f32, hardness: f32, inland: f32) -> (usize,
         0.0
     };
 
-    let height_cond = smoothstep(CLIFF_HEIGHT_LO, CLIFF_HEIGHT_HI, noise_01);
-    let hard_cond   = smoothstep(CLIFF_HARD_LO,   CLIFF_HARD_HI,   hardness);
-    let soft_cond   = 1.0 - hard_cond;
-
-    // Island filter: suppress cliff/bluff on tiny isolated land masses.
-    // `inland` is the minimum continentalness found 200 blocks away in each cardinal
-    // direction.  A tiny island returns values close to 0 or positive (all probes
-    // hit ocean).  A real continental coast returns a clearly negative value in at
-    // least one direction (the interior of the continent).
+    let height_cond    = smoothstep(CLIFF_HEIGHT_LO, CLIFF_HEIGHT_HI, noise_01);
     let land_size_cond = smoothstep(-CLIFF_MIN_INLAND_C, -CLIFF_INLAND_C, inland);
-
-    // cliff_mask: hard rock + tall terrain (main driver), OR very tall terrain
-    // regardless of hardness (steep high coasts form cliffs even in softer rock).
-    let cliff_mask = if CLIFF_DEBUG_MODE {
-        let coast  = if height_above_sea > 0.0 && height_above_sea < CLIFF_COASTAL_WINDOW { 1.0_f32 } else { 0.0 };
-        let height = if noise_01 > (CLIFF_HEIGHT_LO + CLIFF_HEIGHT_HI) * 0.5 { 1.0_f32 } else { 0.0 };
-        let hard   = if hardness > (CLIFF_HARD_LO + CLIFF_HARD_HI) * 0.5 { 1.0_f32 } else { 0.0 };
-        let tall   = if noise_01 > (CLIFF_TALL_LO + CLIFF_TALL_HI) * 0.5 { CLIFF_TALL_SCALE } else { 0.0 };
-        coast * (height * hard).max(tall) * land_size_cond
-    } else {
-        let tall_override = smoothstep(CLIFF_TALL_LO, CLIFF_TALL_HI, noise_01) * CLIFF_TALL_SCALE;
-        coast_strip * (height_cond * hard_cond).max(tall_override) * land_size_cond
-    };
-
-    // bluff_mask: soft rock + elevated terrain → gentler rounded coastal bluff.
-    // Uses a wider coastal window so the approach is more gradual than a cliff.
-    let bluff_coast = if height_above_sea > 0.0 {
-        smoothstep(BLUFF_COASTAL_WINDOW, 0.0, height_above_sea)
-    } else {
-        0.0
-    };
-    let bluff_mask = bluff_coast * height_cond * soft_cond * land_size_cond;
+    let cliff_mask     = coast_strip * height_cond * land_size_cond;
 
     let gap = land_h - base_sy;
-    let sy = (base_sy
-        + gap * cliff_mask * CLIFF_BOOST_SCALE
-        + gap * bluff_mask * BLUFF_BOOST_SCALE)
+    let sy  = (base_sy + gap * cliff_mask * CLIFF_BOOST_SCALE)
         .round().max(1.0) as usize;
     (sy, sy < SEA_LEVEL)
 }

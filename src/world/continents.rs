@@ -25,9 +25,15 @@ const WARP2_AMP_FACTOR: f32    = 0.08;
 const WARP2_PERIOD_FACTOR: f32 = 0.5;
 
 // Coastline jaggedness: multi-octave noise added to the normalised distance.
+//
+// LOW octaves only (wavelengths ≥ ~100 blocks).  Continentalness drives terrain
+// height through cont_factor with a gain of ~100+ blocks per unit of normalised
+// distance, so any fine octave here becomes small-scale height lumps across all
+// land sitting on a dome slope (most of the world).  The former ×8/×16/×32
+// octaves (λ 12–90 blocks) produced ±4–5 block ripples — lumpy terrain.
 const COAST_FREQ_FACTOR: f32 = 5.0;
 const COAST_AMP: f32         = 0.14;
-const COAST_OCT: [f32; 6]    = [0.50, 0.35, 0.20, 0.12, 0.07, 0.04];
+const COAST_OCT: [f32; 3]    = [0.50, 0.35, 0.20];
 
 // ── Data ─────────────────────────────────────────────────────────────────────
 
@@ -131,16 +137,13 @@ fn continent_sample(c: &ContinentDef, fx: f32, fz: f32) -> f32 {
     let ez = wlz / c.rb;
     let t = (ex * ex + ez * ez).sqrt();
 
-    // Coastline noise (6 octaves)
+    // Coastline noise (low octaves only — see COAST_OCT comment)
     let cf = c.coast_freq;
     let px = fx + c.coast_phase;
     let coast =
         simplex2d(px * cf,        fz * cf       ) * COAST_OCT[0] +
         simplex2d(px * cf * 2.0,  fz * cf * 2.0 ) * COAST_OCT[1] +
-        simplex2d(px * cf * 4.0,  fz * cf * 4.0 ) * COAST_OCT[2] +
-        simplex2d(px * cf * 8.0,  fz * cf * 8.0 ) * COAST_OCT[3] +
-        simplex2d(px * cf * 16.0, fz * cf * 16.0) * COAST_OCT[4] +
-        simplex2d(px * cf * 32.0, fz * cf * 32.0) * COAST_OCT[5];
+        simplex2d(px * cf * 4.0,  fz * cf * 4.0 ) * COAST_OCT[2];
 
     let t = (t + coast * COAST_AMP).clamp(0.0, 1.0);
 
