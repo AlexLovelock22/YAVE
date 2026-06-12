@@ -9,7 +9,3 @@
 lod0 = 20
 lod1 = 30
 lod2 = 0
-
-# Terrain noise density: > 1.0 = denser/busier terrain, < 1.0 = smoother.
-# Temporary global control until biome-specific noise exists.
-noise_density = 1.0
