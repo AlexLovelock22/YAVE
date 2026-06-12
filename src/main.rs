@@ -1,5 +1,6 @@
 mod app;
 mod camera;
+mod export;
 mod meshing;
 mod models;
 mod render;
@@ -80,6 +81,11 @@ impl ApplicationHandler for AppRunner {
 
 fn main() -> Result<()> {
     env_logger::init();
+
+    if std::env::args().any(|a| a == "--export-map") {
+        export::export_cliff_maps();
+        return Ok(());
+    }
 
     // Leave half the cores free for the render thread so chunk generation doesn't starve it
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);

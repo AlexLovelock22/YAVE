@@ -1,44 +1,58 @@
 use rayon::prelude::*;
 
 use crate::world::{
-    continents::{build_defs, continentalness_defs, SEA_LEVEL},
-    terrain::{
-        base_elevation_raw, humidity_raw, rock_hardness_raw, sample_column, temperature_raw,
-    },
+    continents::{build_defs, ContinentDef, SEA_LEVEL},
+    noise::simplex2d,
+    terrain::sample_column,
 };
 
-// ── Configuration ─────────────────────────────────────────────────────────────
+// ── Map settings ──────────────────────────────────────────────────────────────
 
-/// World-space centre of every exported map.
-pub const CENTER_X: i32 = 2048;
-pub const CENTER_Z: i32 = 2048;
+const CENTER_X:    i32 = 2048;
+const CENTER_Z:    i32 = 2048;
+const HALF_EXTENT: i32 = 1500;
+const IMAGE_PX:    u32 = 1024;
+const SCALE:       i32 = (HALF_EXTENT * 2) / IMAGE_PX as i32;
 
-const HALF_EXTENT: i32 = 4096;     // ±4096 blocks from centre
-const IMAGE_PX:    u32  = 1024;    // pixels per side
-const SCALE: i32 = (HALF_EXTENT * 2) / IMAGE_PX as i32; // blocks per pixel = 8
+// Land pixels within this many pixels of an ocean pixel are "coastal".
+// At ~11 blocks/px, depth=2 ≈ 22 blocks from the shoreline.
+const COASTAL_DEPTH: i32 = 2;
 
-// ── Per-pixel sample ──────────────────────────────────────────────────────────
+// ── Cliff arc-noise parameters ────────────────────────────────────────────────
+
+// 2D world-space noise blobs — section length = blob_size * cliff_fraction.
+// No tangent projection: avoids the curvature artifact where s oscillates on
+// wiggly coasts and creates tiny blotches.
+const CLIFF_BLOB_FREQ:  f32 = 1.0 / 3600.0; // blob size ≈ 3600 blocks → sections ~1600 blocks
+const CLIFF_SLOW_FREQ:  f32 = 1.0 / 15000.0; // slow modulation → occasional long breaks
+const CLIFF_ARC_SEED:   f32 = 31.7;
+const CLIFF_THRESHOLD:  f32 = 0.55;          // ~45% cliff, ~55% break
+const CLIFF_BLEND:      f32 = 0.10;
+
+// ── Two-pass sample types ─────────────────────────────────────────────────────
+
+struct RawSample {
+    cliff_noise: f32,   // arc noise result (0..1); no coast-proximity mask yet
+    surface_y:   usize,
+    is_ocean:    bool,
+}
 
 struct Sample {
-    c:         f32,
-    h:         f32,
-    e:         f32,
-    t:         f32,
-    u:         f32,
+    cliff:     f32,     // final cliff value: arc noise if coastal, else 0
     surface_y: usize,
     is_ocean:  bool,
-    biome:     u8,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-pub fn export_noise_maps() {
-    let n = IMAGE_PX as usize * IMAGE_PX as usize;
+pub fn export_cliff_maps() {
+    let n = (IMAGE_PX * IMAGE_PX) as usize;
     println!(
-        "[export] Sampling {n} points ({IMAGE_PX}×{IMAGE_PX}, {SCALE} blocks/px, ±{HALF_EXTENT} blocks from ({CENTER_X},{CENTER_Z}))…"
+        "[export] {IMAGE_PX}×{IMAGE_PX} px, {SCALE} blocks/px, ±{HALF_EXTENT} blocks from ({CENTER_X},{CENTER_Z})"
     );
 
-    let rows: Vec<Sample> = (0..n)
+    // Pass 1 — terrain heights + arc noise per pixel (fully parallel).
+    let raw: Vec<RawSample> = (0..n)
         .into_par_iter()
         .map(|i| {
             let px = (i % IMAGE_PX as usize) as i32;
@@ -47,51 +61,71 @@ pub fn export_noise_maps() {
             let wz = CENTER_Z + (pz - IMAGE_PX as i32 / 2) * SCALE;
             let (fx, fz) = (wx as f32, wz as f32);
 
-            let defs = build_defs(wx, wz);
-            let col  = sample_column(&defs, wx, wz);
-            Sample {
-                c:         continentalness_defs(&defs, fx, fz),
-                h:         rock_hardness_raw(fx, fz).clamp(0.0, 1.0),
-                e:         base_elevation_raw(fx, fz),
-                t:         temperature_raw(fx, fz),
-                u:         humidity_raw(fx, fz),
-                surface_y: col.surface_y,
-                is_ocean:  col.is_ocean,
-                biome:     col.biome,
-            }
+            let defs        = build_defs(wx, wz);
+            let col         = sample_column(&defs, wx, wz);
+            let cliff_noise = arc_noise(&defs, fx, fz);
+
+            RawSample { cliff_noise, surface_y: col.surface_y, is_ocean: col.is_ocean }
         })
         .collect();
 
-    save_gray("noise_continentalness.png", &rows, |s| {
-        ((-s.c * 0.6 + 0.5).clamp(0.0, 1.0) * 255.0) as u8
-    });
-    save_gray("noise_hardness.png", &rows, |s| {
-        (s.h * 255.0) as u8
-    });
-    save_gray("noise_elevation.png", &rows, |s| {
-        ((s.e * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8
-    });
-    save_gray("noise_temperature.png", &rows, |s| {
-        ((s.t * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8
-    });
-    save_gray("noise_humidity.png", &rows, |s| {
-        ((s.u * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0) as u8
-    });
-    save_gray("noise_surface_height.png", &rows, |s| {
-        ((s.surface_y as f32 / 256.0) * 255.0) as u8
-    });
-    save_rgb("world_surface.png", &rows, |s| {
-        terrain_color(s.surface_y, s.is_ocean, s.biome)
+    // Pass 2 — cliff mask: apply arc noise only where land is adjacent to ocean.
+    // This aligns the cliff band with the rendered terrain edge, not a continentalness
+    // proxy that can be hundreds of blocks off in bays / irregular coastlines.
+    let rows: Vec<Sample> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let s = &raw[i];
+            let cliff = if !s.is_ocean && is_coastal(&raw, i) {
+                s.cliff_noise
+            } else {
+                0.0
+            };
+            Sample { cliff, surface_y: s.surface_y, is_ocean: s.is_ocean }
+        })
+        .collect();
+
+    save_rgb("map_continent.png", &rows, |s| terrain_color(s.surface_y, s.is_ocean));
+    save_rgb("map_cliffs.png",    &rows, |s| {
+        let base = terrain_color(s.surface_y, s.is_ocean);
+        if s.is_ocean { base } else { blend_red(base, s.cliff) }
     });
 
-    println!("[export] Done.");
+    println!("[export] Done — map_continent.png  map_cliffs.png");
 }
 
-// ── Colour mapping ────────────────────────────────────────────────────────────
+// ── Second-pass coastal test ──────────────────────────────────────────────────
 
-fn terrain_color(sy: usize, is_ocean: bool, biome: u8) -> [u8; 3] {
-    use crate::world::terrain::{BIOME_ALPINE, BIOME_DESERT, BIOME_TUNDRA};
+fn is_coastal(raw: &[RawSample], i: usize) -> bool {
+    let w  = IMAGE_PX as i32;
+    let px = (i % IMAGE_PX as usize) as i32;
+    let pz = (i / IMAGE_PX as usize) as i32;
+    for dz in -COASTAL_DEPTH..=COASTAL_DEPTH {
+        for dx in -COASTAL_DEPTH..=COASTAL_DEPTH {
+            let nx = (px + dx).clamp(0, w - 1);
+            let nz = (pz + dz).clamp(0, w - 1);
+            if raw[(nx + nz * w) as usize].is_ocean {
+                return true;
+            }
+        }
+    }
+    false
+}
 
+// ── Arc noise (tangent-projected) ─────────────────────────────────────────────
+
+fn arc_noise(_defs: &[ContinentDef; 9], fx: f32, fz: f32) -> f32 {
+    // Two 2D octaves in world space. No tangent projection — blob size maps
+    // directly to section length regardless of how the coast curves.
+    let n1 = simplex2d(fx * CLIFF_BLOB_FREQ,  fz * CLIFF_BLOB_FREQ  + CLIFF_ARC_SEED);
+    let n2 = simplex2d(fx * CLIFF_SLOW_FREQ,  fz * CLIFF_SLOW_FREQ  + CLIFF_ARC_SEED + 7.3);
+    let noise01 = (n1 * 0.65 + n2 * 0.35) * 0.5 + 0.5;
+    smoothstep(CLIFF_THRESHOLD, CLIFF_THRESHOLD + CLIFF_BLEND, noise01)
+}
+
+// ── Colour helpers ────────────────────────────────────────────────────────────
+
+fn terrain_color(sy: usize, is_ocean: bool) -> [u8; 3] {
     if is_ocean {
         let depth = SEA_LEVEL.saturating_sub(sy);
         return match depth {
@@ -101,59 +135,45 @@ fn terrain_color(sy: usize, is_ocean: bool, biome: u8) -> [u8; 3] {
             _       => [ 12,  40, 110],
         };
     }
-
-    // Biome-tinted land colouring
     let above = sy.saturating_sub(SEA_LEVEL);
-    match biome {
-        BIOME_DESERT => match above {
-            0..=2   => [225, 210, 140],  // beach / low desert
-            3..=30  => [210, 185,  95],  // sandy plains
-            _       => [180, 155,  75],  // desert upland
-        },
-        BIOME_ALPINE => match above {
-            0..=60  => [130, 120, 110],  // rocky mountain base
-            61..=90 => [170, 165, 155],  // high rock
-            _       => [230, 230, 230],  // snow peak
-        },
-        BIOME_TUNDRA => match above {
-            0..=5   => [170, 185, 165],  // low tundra
-            _       => [195, 200, 185],  // tundra upland
-        },
-        _ => match above {
-            0..=2   => [215, 205, 135],  // beach / sand
-            3..=20  => [ 95, 155,  65],  // coastal plain
-            21..=55 => [ 85, 120,  55],  // hills
-            56..=90 => [105, 100,  80],  // mountain base
-            91..=110=> [155, 145, 130],  // high mountain
-            _       => [225, 225, 225],  // snow peak
-        },
+    match above {
+        0..=2   => [215, 205, 135],
+        3..=20  => [ 95, 155,  65],
+        21..=55 => [ 85, 120,  55],
+        56..=90 => [105, 100,  80],
+        _       => [225, 225, 225],
     }
 }
 
-// ── PNG writers ───────────────────────────────────────────────────────────────
-
-fn save_gray<T, F>(path: &str, data: &[T], f: F)
-where
-    F: Fn(&T) -> u8,
-{
-    let buf: Vec<u8> = data.iter().map(f).collect();
-    match image::GrayImage::from_raw(IMAGE_PX, IMAGE_PX, buf) {
-        Some(img) => match img.save(path) {
-            Ok(_)  => println!("[export]   {path}"),
-            Err(e) => eprintln!("[export]   {path} FAILED: {e}"),
-        },
-        None => eprintln!("[export]   {path} FAILED: buffer size mismatch"),
-    }
+fn blend_red(base: [u8; 3], t: f32) -> [u8; 3] {
+    let t = t.clamp(0.0, 1.0);
+    [
+        lerp_u8(base[0], 220, t),
+        lerp_u8(base[1],  35, t),
+        lerp_u8(base[2],  35, t),
+    ]
 }
+
+#[inline] fn lerp_u8(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t).round() as u8
+}
+
+#[inline] fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
+    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+// ── PNG writer ────────────────────────────────────────────────────────────────
 
 fn save_rgb<T, F>(path: &str, data: &[T], f: F)
 where
-    F: Fn(&T) -> [u8; 3],
+    F: Fn(&T) -> [u8; 3] + Send + Sync,
+    T: Sync,
 {
     let buf: Vec<u8> = data.iter().flat_map(|d| f(d)).collect();
     match image::RgbImage::from_raw(IMAGE_PX, IMAGE_PX, buf) {
         Some(img) => match img.save(path) {
-            Ok(_)  => println!("[export]   {path}"),
+            Ok(_)  => println!("[export]   wrote {path}"),
             Err(e) => eprintln!("[export]   {path} FAILED: {e}"),
         },
         None => eprintln!("[export]   {path} FAILED: buffer size mismatch"),

@@ -21,7 +21,7 @@ const WARP1_AMP_FACTOR: f32    = 0.35;
 const WARP1_PERIOD_FACTOR: f32 = 1.5;
 
 // Medium-scale domain warp (bays, capes, peninsulas).
-const WARP2_AMP_FACTOR: f32    = 0.08;
+const WARP2_AMP_FACTOR: f32    = 0.04;
 const WARP2_PERIOD_FACTOR: f32 = 0.5;
 
 // Coastline jaggedness: multi-octave noise added to the normalised distance.
@@ -32,8 +32,8 @@ const WARP2_PERIOD_FACTOR: f32 = 0.5;
 // land sitting on a dome slope (most of the world).  The former ×8/×16/×32
 // octaves (λ 12–90 blocks) produced ±4–5 block ripples — lumpy terrain.
 const COAST_FREQ_FACTOR: f32 = 5.0;
-const COAST_AMP: f32         = 0.14;
-const COAST_OCT: [f32; 3]    = [0.50, 0.35, 0.20];
+const COAST_AMP: f32         = 0.07;
+const COAST_OCT: [f32; 3]    = [0.75, 0.18, 0.07];
 
 // ── Data ─────────────────────────────────────────────────────────────────────
 
