@@ -83,6 +83,7 @@ fn main() -> Result<()> {
     env_logger::init();
 
     if std::env::args().any(|a| a == "--export-map") {
+        settings::load(); // applies noise_density so the map matches the game
         export::export_cliff_maps();
         return Ok(());
     }
