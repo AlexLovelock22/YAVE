@@ -17,8 +17,9 @@ const LAND_DEPTH:      f32 = 0.82;
 const TERRAIN_FREQ: f32 = 1.0 / 4_000.0;
 const TERRAIN_SEED: f32 = 0.0;
 
-/// Multiplier on TERRAIN_FREQ, set once from settings.toml (`noise_density`)
-/// before any chunk generation starts.  Stored as f32 bits.
+/// Amplitude multiplier on terrain noise (and cliff detail), set once from
+/// settings.toml before chunk generation starts.  Stored as f32 bits so it
+/// can be written from the main thread and read lock-free from rayon workers.
 static NOISE_DENSITY: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(f32::to_bits(1.0));
 
@@ -68,13 +69,13 @@ const CLIFF_HEIGHT: f32 = 60.0;
 // 0.0005 per block, so 0.06 ≈ 120 blocks).
 const PLATEAU_DEPTH_C: f32 = 0.06;
 
+// Rounding width of the plateau shoulder in continentalness units: the top
+// eases into the ramp via smooth-max instead of kinking at the plateau edge.
+const RAMP_ONSET_C: f32 = 0.06;
+
 // Constant descent gradient of the ramp beyond the plateau.  In block terms
 // this is ≈ 280 × 0.0005 = 0.14 blocks of descent per block walked inland.
 const CLIFF_RAMP_BLOCKS_PER_C: f32 = 280.0;
-
-// Rounding of the plateau shoulder where the ramp begins (smooth-max width in
-// continentalness units): the top eases into the descent instead of kinking.
-const RAMP_ONSET_C: f32 = 0.06;
 
 // Domain warp on the inland coordinate so the plateau edge and ramp wander
 // instead of running parallel to the coast.  Two octaves: a broad sweep and a
@@ -91,7 +92,6 @@ const FALL_WARP_RAMP_C:  f32 = 0.06;
 // merge happens in trend space (noise-free), so it can be generous.
 const TAKEOVER_SMOOTH: f32 = 16.0;
 
-
 // How far the cliff trend sinks below sea level where the blob is 0, scaled
 // by (1 - blob).  This keeps the field continuous across the blob threshold
 // (a 0.0 sentinel puts a visible step along the blob contour inland) and
@@ -99,6 +99,15 @@ const TAKEOVER_SMOOTH: f32 = 16.0;
 // the smooth-max's reach.
 const CLIFF_EDGE_DROP: f32 = 30.0;
 
+
+// Cliff-top detail octaves: added to the cliff surface and faded by how much
+// the cliff surface rises above the terrain trend, so they're zero at the
+// seam and full on the open plateau.  Scaled by noise_density so the same
+// setting controls mainland and cliff-top lumpiness together.
+const TOP_FREQ1: f32 = 1.0 / 400.0;
+const TOP_AMP1:  f32 = 8.0;   // ≈ ±8 blocks of medium-scale relief
+const TOP_FREQ2: f32 = 1.0 / 120.0;
+const TOP_AMP2:  f32 = 3.5;   // ≈ ±3.5 blocks of fine jitter
 
 // These must stay in sync with export.rs so the preview map matches the game.
 const CLIFF_BLOB_FREQ:  f32 = 1.0 / 3_600.0;
@@ -200,7 +209,7 @@ fn surface_from_cv(c: f32, noise_01: f32, cliff_h: f32) -> (usize, bool) {
         return (base_sy, is_ocean);
     }
     let trend      = base_height_f(c, 0.5);
-    let noise_part = base_height_f(c, noise_01) - trend;
+    let noise_part = (base_height_f(c, noise_01) - trend) * noise_density();
     let h  = smooth_max(trend, cliff_h, TAKEOVER_SMOOTH) + noise_part;
     let sy = h.round().max(1.0) as usize;
     (sy, sy < SEA_LEVEL)
@@ -227,10 +236,19 @@ fn cliff_at(fx: f32, fz: f32, c: f32) -> f32 {
         + simplex2d(fx * FALL_WARP_FREQ2, fz * FALL_WARP_FREQ2 + CLIFF_SEED + 27.4)
             * FALL_WARP_AMP2_C)
         * smoothstep(0.0, FALL_WARP_RAMP_C, inland);
-    // Smooth onset: the plateau shoulder eases into the descent.
+    // Smooth onset: plateau shoulder eases into the descent (no hard kink).
     let ramp = smooth_max(0.0, inland + warp - PLATEAU_DEPTH_C, RAMP_ONSET_C);
-    SEA_LEVEL as f32 + blob * CLIFF_HEIGHT - (1.0 - blob) * CLIFF_EDGE_DROP
-        - ramp * CLIFF_RAMP_BLOCKS_PER_C
+    let base = SEA_LEVEL as f32 + blob * CLIFF_HEIGHT - (1.0 - blob) * CLIFF_EDGE_DROP
+        - ramp * CLIFF_RAMP_BLOCKS_PER_C;
+    // Detail octaves: zero at the seam (where cliff ≈ terrain trend), full on
+    // the open plateau.  Scaled by noise_density so one setting controls both
+    // mainland and cliff-top lumpiness.
+    let terrain_trend = base_height_f(c, 0.5);
+    let lift_blend = ((base - terrain_trend) / TAKEOVER_SMOOTH).clamp(0.0, 1.0);
+    let detail = (simplex2d(fx * TOP_FREQ1, fz * TOP_FREQ1 + CLIFF_SEED + 41.3) * TOP_AMP1
+        + simplex2d(fx * TOP_FREQ2, fz * TOP_FREQ2 + CLIFF_SEED + 53.7) * TOP_AMP2)
+        * lift_blend * noise_density();
+    base + detail
 }
 
 /// 2-D blob noise in world space — determines which sections of coast are cliffs.
@@ -243,8 +261,7 @@ fn cliff_noise(fx: f32, fz: f32) -> f32 {
 }
 
 fn terrain_noise(fx: f32, fz: f32) -> f32 {
-    let f = TERRAIN_FREQ * noise_density();
-    simplex2d(fx * f, fz * f + TERRAIN_SEED).clamp(-1.0, 1.0)
+    simplex2d(fx * TERRAIN_FREQ, fz * TERRAIN_FREQ + TERRAIN_SEED).clamp(-1.0, 1.0)
 }
 
 fn cont_factor(c: f32) -> f32 {
