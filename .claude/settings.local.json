@@ -22,7 +22,8 @@
       "Bash(powershell -Command 'Add-Type -AssemblyName System.Drawing; $img = [System.Drawing.Image]::FromFile\\('\\\\''C:/Users/kloak/YAVE/Textures/water.png'\\\\''\\); Write-Output \"$\\($img.Width\\)x$\\($img.Height\\)\"')",
       "Bash(Remove-Item \"c:/Users/kloak/YAVE/Textures/water.png\" -Force)",
       "Bash(Remove-Item \"c:\\\\Users\\\\kloak\\\\YAVE\\\\shaders\\\\ssao.frag\", \"c:\\\\Users\\\\kloak\\\\YAVE\\\\shaders\\\\blur.frag\", \"c:\\\\Users\\\\kloak\\\\YAVE\\\\shaders\\\\composite.frag\", \"c:\\\\Users\\\\kloak\\\\YAVE\\\\shaders\\\\fullscreen.vert\" -ErrorAction Stop)",
-      "Bash(Write-Output \"Deleted\")"
+      "Bash(Write-Output \"Deleted\")",
+      "WebSearch"
     ]
   }
 }

@@ -2,13 +2,13 @@ use std::f32::consts::TAU;
 
 use crate::world::noise::simplex2d;
 
-pub const CELL_SIZE: i32 = 4_000;
+pub const CELL_SIZE: i32 = 8_000;
 pub const SEA_LEVEL: usize = 120;
 
 // ── Tuning ────────────────────────────────────────────────────────────────────
 
-const MIN_RADIUS: f32 = 2_000.0;
-const MAX_RADIUS: f32 = 3_500.0;
+const MIN_RADIUS: f32 = 4_000.0;
+const MAX_RADIUS: f32 = 7_000.0;
 const MIN_ASPECT: f32 = 0.8;
 const MAX_ASPECT: f32 = 1.5;
 
@@ -34,6 +34,16 @@ const WARP2_PERIOD_FACTOR: f32 = 0.5;
 const COAST_FREQ_FACTOR: f32 = 5.0;
 const COAST_AMP: f32         = 0.07;
 const COAST_OCT: [f32; 3]    = [0.75, 0.18, 0.07];
+
+// Fine shoreline jaggedness: a fixed world-scale octave (~40-block wavelength)
+// displacing the coast by a few blocks — per-chunk detail.  The amplitude is
+// given in blocks and divided by the continent radius in continent_sample, so
+// jaggedness is the same regardless of continent size.  Unlike the old fine
+// COAST_OCT octaves this can't lump the terrain: continentalness now only
+// places the coastline (height comes from the noise map in terrain.rs), and a
+// c-ripple this small is invisible through the LAND_DEPTH amplitude ramp.
+const JAG_FREQ:   f32 = 1.0 / 40.0;
+const JAG_BLOCKS: f32 = 9.0;
 
 // ── Data ─────────────────────────────────────────────────────────────────────
 
@@ -145,7 +155,9 @@ fn continent_sample(c: &ContinentDef, fx: f32, fz: f32) -> f32 {
         simplex2d(px * cf * 2.0,  fz * cf * 2.0 ) * COAST_OCT[1] +
         simplex2d(px * cf * 4.0,  fz * cf * 4.0 ) * COAST_OCT[2];
 
-    let t = (t + coast * COAST_AMP).clamp(0.0, 1.0);
+    let jag = simplex2d((fx + c.coast_phase) * JAG_FREQ, fz * JAG_FREQ + 11.9)
+            * (JAG_BLOCKS / c.ra);
+    let t = (t + coast * COAST_AMP + jag).clamp(0.0, 1.0);
 
     // Dome: (1 - smoothstep(0,1,t))³
     let s = t * t * (3.0 - 2.0 * t); // smoothstep

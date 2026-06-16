@@ -3,7 +3,7 @@ use glam::IVec3;
 use crate::world::block::BlockId;
 
 pub const CHUNK_SIZE: usize = 32;
-pub const CHUNK_HEIGHT: usize = 256;
+pub const CHUNK_HEIGHT: usize = 512;
 
 /// Flat array storage: index = x + z * CHUNK_SIZE + y * CHUNK_SIZE * CHUNK_SIZE
 #[derive(Clone)]
